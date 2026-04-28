@@ -108,6 +108,24 @@ def setup_logging():
     day = datetime.datetime.now().strftime("%Y-%m-%d")
     log_dir = os.path.join(DATA_ROOT, "logs", "app", day)
     os.makedirs(log_dir, exist_ok=True)
+    # Configure and return a logger instance
+    logger = logging.getLogger("mt5_manager_app")
+    logger.setLevel(logging.DEBUG)
+    if not logger.handlers:
+        # File handler
+        try:
+            fh = logging.FileHandler(os.path.join(log_dir, "app.log"), encoding='utf-8')
+            fh.setLevel(logging.DEBUG)
+            fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+            logger.addHandler(fh)
+        except Exception:
+            pass
+        # Console handler
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.INFO)
+        ch.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logger.addHandler(ch)
+    return logger
 
 
 logger = setup_logging()
@@ -909,8 +927,8 @@ class MT5ManagerApp:
         ttk.Label(stat_row, textvariable=self.dash_agents_var).grid(row=0, column=1, sticky=tk.W, padx=(6,0))
         ttk.Label(stat_row, text="Known Positions:").grid(row=1, column=0, sticky=tk.W, pady=(6,0))
         ttk.Label(stat_row, textvariable=self.dash_positions_var).grid(row=1, column=1, sticky=tk.W, padx=(6,0), pady=(6,0))
-        ttk.Label(dash_frame, text="Terminal Disk Usage:").grid(row=3, column=0, sticky=tk.W, padx=6, pady=4)
-        ttk.Label(dash_frame, textvariable=self.dash_disk_var).grid(row=3, column=1, sticky=tk.W)
+        ttk.Label(stat_row, text="Terminal Disk Usage:").grid(row=2, column=0, sticky=tk.W, padx=6, pady=4)
+        ttk.Label(stat_row, textvariable=self.dash_disk_var).grid(row=2, column=1, sticky=tk.W)
 
     # ------------------------------------------------------------------
     #  New: Portable Terminals Setup
