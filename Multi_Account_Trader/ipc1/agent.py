@@ -15,6 +15,7 @@ import logging
 import traceback
 import subprocess
 from pathlib import Path
+import datetime
 
 try:
     import MetaTrader5 as mt5
@@ -28,17 +29,7 @@ def setup_logger(account_id, agent_root=None):
     log.setLevel(logging.DEBUG)
     if log.handlers:
         return log
-    if agent_root is None:
-        agent_root = Path.cwd()
-    log_dir = Path(agent_root) / "agent_logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    fh = logging.FileHandler(str(log_dir / f"agent_{account_id}.log"), encoding='utf-8')
-    fh.setFormatter(logging.Formatter('%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
-    log.addHandler(fh)
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(logging.Formatter('%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
-    log.addHandler(ch)
-    return log
+    
 
 
 # ----------------- Safe serialization -----------------
@@ -98,8 +89,18 @@ def serialize_mt5_result(obj):
 
 
 # ----------------- CSV trade logging -----------------
+
+def get_data_root():
+    if os.name == "nt":
+        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+    else:
+        base = os.path.join(os.path.expanduser("~"), ".config")
+    root = os.path.join(base, "Trading_System")
+    return root
+
+
 def trades_csv_path_for(account_id):
-    root = Path.cwd() / "ipc1" / "agent_logs"
+    root = Path(get_data_root()) / "ipc1" / "agent_logs"
     root.mkdir(parents=True, exist_ok=True)
     return root / f"trades_{account_id}.csv"
 
@@ -157,6 +158,26 @@ def get_positions_serialized():
         return out
     except Exception:
         return []
+
+
+def get_today_pnl():
+    if mt5 is None:
+        return None
+    try:
+        now_dt = datetime.datetime.now()
+        start_dt = datetime.datetime(now_dt.year, now_dt.month, now_dt.day)
+        deals = mt5.history_deals_get(start_dt, now_dt)
+        if not deals:
+            return 0.0
+        total = 0.0
+        for d in deals:
+            try:
+                total += float(getattr(d, 'profit', 0.0))
+            except Exception:
+                continue
+        return total
+    except Exception:
+        return None
 
 
 def place_order_local(symbol, side, volume, deviation=50, price=None, sl=0.0, tp=0.0, magic=0,
@@ -257,7 +278,13 @@ def place_order_local(symbol, side, volume, deviation=50, price=None, sl=0.0, tp
         res = mt5.order_send(req)
         if res is None:
             return False, "order_send returned None"
-        return True, serialize_mt5_result(res)
+
+        retcode = int(getattr(res, "retcode", -1))
+        # 10009 = DONE, 10008 = PLACED (pending)
+        if retcode in (10009, 10008):
+            return True, serialize_mt5_result(res)
+        else:
+            return False, serialize_mt5_result(res)
 
     except Exception as e:
         if logger:
@@ -391,6 +418,8 @@ def agent_main(cmd_q, resp_q, account_cfg):
     def try_connect():
         nonlocal connected
         try:
+            if not account_cfg.get("password") or not account_cfg.get("server"):
+                return False, "missing password or server"
             ok, err = initialize_mt5(terminal_path, logger=logger)
             if not ok:
                 logger.error(f"initialize failed: {err}")
@@ -429,6 +458,14 @@ def agent_main(cmd_q, resp_q, account_cfg):
                 cmd = None
 
             now = time.time()
+            # auto‑refresh login if connection dropped
+            if connected:
+                try:
+                    ai = mt5.account_info()
+                    if ai is None:
+                        connected = False
+                except Exception:
+                    connected = False
             if now - last_hb >= hb_interval:
                 try:
                     resp_q.put({"type": "hb", "account": account_id, "ts": now})
@@ -538,6 +575,22 @@ def agent_main(cmd_q, resp_q, account_cfg):
                 pos = get_positions_serialized()
                 try:
                     resp_q.put({"id": cid, "status": "ok", "result": pos})
+                except Exception:
+                    pass
+                continue
+
+            if action == "get_today_pnl":
+                if not connected:
+                    ok, err = try_connect()
+                    if not ok:
+                        try:
+                            resp_q.put({"id": cid, "status": "error", "error": f"not connected: {err}"})
+                        except Exception:
+                            pass
+                        continue
+                pnl = get_today_pnl()
+                try:
+                    resp_q.put({"id": cid, "status": "ok", "result": pnl})
                 except Exception:
                     pass
                 continue

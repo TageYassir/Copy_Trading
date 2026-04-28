@@ -10,6 +10,11 @@ from multiprocessing import get_context
 from multiprocessing import Queue
 import threading
 
+try:
+    from Multi_Account_Trader.ipc1 import agent as agent_module
+except Exception:
+    agent_module = None
+
 # Each agent has (process, cmd_queue, resp_queue)
 class ControllerAgent:
     def __init__(self):
@@ -29,9 +34,10 @@ class ControllerAgent:
             cmd_q = self._ctx.Queue()
             resp_q = self._ctx.Queue()
             # Use spawn context to create a new process that runs agent.agent_main
-            # We import agent here to avoid heavy import in main module startup
-            from Multi_Account_Trader.ipc1.agent import agent_main
-            proc = self._ctx.Process(target=agent_main, args=(cmd_q, resp_q, account_cfg), daemon=True)
+            # Use the pre-imported agent_module to avoid hidden-import issues (PyInstaller)
+            if agent_module is None:
+                return False, "agent module not available"
+            proc = self._ctx.Process(target=agent_module.agent_main, args=(cmd_q, resp_q, account_cfg), daemon=True)
             proc.start()
             # Wait for heartbeat or successful start
             start_ts = time.time()
@@ -51,6 +57,10 @@ class ControllerAgent:
                 time.sleep(0.2)
             self._agents[acc] = {"proc": proc, "cmd_q": cmd_q, "resp_q": resp_q, "cfg": account_cfg}
             return True
+
+    def active_agents(self):
+        with self._lock:
+            return list(self._agents.keys())
 
     def stop_agent(self, account_id, timeout=10):
         acc = str(account_id)

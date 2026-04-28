@@ -22,6 +22,8 @@ import random
 import shutil
 from pathlib import Path
 
+import multiprocessing
+
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -36,9 +38,27 @@ try:
 except Exception:
     ControllerAgent = None
 
+def get_data_root():
+    """Return application data root.
+    Windows: %APPDATA%/Trading_System
+    Linux/Mac: $XDG_CONFIG_HOME/Trading_System or ~/.config/Trading_System
+    """
+    if os.name == "nt":
+        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+        data_root = os.path.join(base, "Trading_System")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME", os.path.join(os.path.expanduser("~"), ".config"))
+        data_root = os.path.join(base, "Trading_System")
+    try:
+        os.makedirs(data_root, exist_ok=True)
+    except Exception:
+        pass
+    return data_root
+
 # Config
-ACCOUNTS_FILE = "mt5_accounts.json"
-SETTINGS_FILE = "mt5_settings.json"
+DATA_ROOT = get_data_root()
+ACCOUNTS_FILE = os.path.join(DATA_ROOT, "mt5_accounts.json")
+SETTINGS_FILE = os.path.join(DATA_ROOT, "mt5_settings.json")
 
 # Default settings
 DEFAULT_SETTINGS = {
@@ -85,34 +105,9 @@ SETTINGS = load_settings()
 
 def setup_logging():
     """Setup logging to file and console"""
-    # Log folder next to the script
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    log_dir = os.path.join(script_dir, "logs")
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir)
-
-    logger = logging.getLogger('MT5Manager')
-    logger.setLevel(logging.DEBUG if SETTINGS.get('debug_mode', True) else logging.INFO)
-    logger.handlers.clear()
-
-    # File handler
-    log_file = os.path.join(log_dir, f'mt5_manager_{datetime.datetime.now().strftime("%Y%m%d")}.log')
-    fh = logging.FileHandler(log_file, encoding='utf-8')
-    fh.setLevel(logging.DEBUG)
-
-    # Console handler
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO)
-
-    # Same format as app log
-    formatter = logging.Formatter('%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-    fh.setFormatter(formatter)
-    ch.setFormatter(formatter)
-
-    logger.addHandler(fh)
-    logger.addHandler(ch)
-
-    return logger
+    day = datetime.datetime.now().strftime("%Y-%m-%d")
+    log_dir = os.path.join(DATA_ROOT, "logs", "app", day)
+    os.makedirs(log_dir, exist_ok=True)
 
 
 logger = setup_logging()
@@ -135,7 +130,8 @@ def log_message(message, level='INFO'):
 def default_store():
     return {
         "accounts": [],
-        "groups": [{"name": "default", "vol_multiplier": 1.0, "forced_volume": 0.0, "active": True}],
+        "groups": [{"name": "default", "vol_multiplier": 1.0, "forced_volume": 0.0, "active": True,
+                     "max_positions_per_symbol": 0, "max_total_lots": 0.0}],
         "source_package": ""
     }
 
@@ -158,12 +154,85 @@ def load_store(path=ACCOUNTS_FILE):
     # Ensure all accounts have terminal_path field (default empty)
     for a in data["accounts"]:
         a.setdefault("terminal_path", "")
+    # Ensure group defaults include new risk cap fields
+    for g in data.get("groups", []):
+        g.setdefault("max_positions_per_symbol", 0)
+        g.setdefault("max_total_lots", 0.0)
     return data
 
 
 def save_store(store, path=ACCOUNTS_FILE):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(store, f, indent=2)
+
+
+# Helpers for portable terminal cloning and name sanitization
+def sanitize_name(text):
+    return "".join(c for c in str(text) if c.isalnum() or c in ("_", "-")).strip() or "default"
+
+
+def clone_mt5_folder(base_dir, target_dir):
+    base_dir = Path(base_dir)
+    target_dir = Path(target_dir)
+    if not base_dir.exists():
+        return False, f"base dir not found: {base_dir}"
+    try:
+        if target_dir.exists():
+            return True, None
+
+        def same_drive(path_a, path_b):
+            try:
+                if os.name == "nt":
+                    return os.path.splitdrive(str(path_a))[0].lower() == os.path.splitdrive(str(path_b))[0].lower()
+                # On POSIX, compare device id
+                return os.stat(path_a).st_dev == os.stat(path_b).st_dev
+            except Exception:
+                return False
+
+        # If base and target are on same drive, try to use hardlinks for files to save space
+        if same_drive(base_dir, Path(DATA_ROOT)):
+            try:
+                shutil.copytree(str(base_dir), str(target_dir), copy_function=os.link)
+            except Exception:
+                # fallback to normal copy if hardlinking fails
+                shutil.copytree(str(base_dir), str(target_dir))
+        else:
+            shutil.copytree(str(base_dir), str(target_dir))
+
+        try:
+            (target_dir / "portable.dat").touch()
+        except Exception:
+            pass
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def ensure_account_terminal(acc, base_path):
+    """Ensure a per-account portable MT5 copy exists; returns (exe_path, error)"""
+    try:
+        if not base_path:
+            return None, "no base path"
+        base_exe = Path(base_path)
+        base_dir = base_exe.parent if base_exe.is_file() else base_exe
+        acct_name = sanitize_name(acc.get("account") or acc.get("name") or "acct")
+        target_root = Path(DATA_ROOT) / "MT5_Portable"
+        target_dir = target_root / f"MT5_{acct_name}"
+        ok, err = clone_mt5_folder(base_dir, target_dir)
+        if not ok:
+            return None, err
+        # locate exe
+        candidates = ["terminal64.exe", "terminal.exe", "metatrader5.exe", "metaeditor64.exe", "metaeditor.exe"]
+        for c in candidates:
+            p = target_dir / c
+            if p.exists():
+                return str(p), None
+        matches = list(target_dir.rglob('*.exe'))
+        if matches:
+            return str(matches[0]), None
+        return None, "no executable found in cloned folder"
+    except Exception as e:
+        return None, str(e)
 
 
 # ----------------------------------------------------------------------
@@ -547,18 +616,12 @@ class MT5ManagerApp:
         self.micro_delay_max_var = tk.DoubleVar(value=self.settings.get('micro_delay_max', 0.5))
 
         # Agent controller (multiprocessing-based per-account agents)
+        os.environ["TRADING_SYSTEM_DATA_DIR"] = DATA_ROOT
         if ControllerAgent is None:
             self.agent_controller = None
             log_message("ControllerAgent not available; agents disabled", 'WARNING')
         else:
             self.agent_controller = ControllerAgent()
-            # Optionally start agents for active accounts at startup
-            for acc in self.store.get("accounts", []):
-                if acc.get("active", True):
-                    try:
-                        self.agent_controller.start_agent(acc)
-                    except Exception as e:
-                        log_message(f"Failed to start agent for {acc.get('account')}: {e}", 'ERROR')
 
         self.positions_q = queue.Queue()
         self._refresh_in_progress = False
@@ -581,6 +644,13 @@ class MT5ManagerApp:
             a.setdefault("active", a.get("active", True))
             a.setdefault("group", a.get("group", "default"))
             a.setdefault("terminal_path", a.get("terminal_path", ""))
+            # per-account risk / cooldown defaults
+            a.setdefault("max_positions_per_symbol", 0)
+            a.setdefault("max_daily_drawdown", 0.0)   # currency, 0 = off
+            a.setdefault("fail_count", 0)
+            a.setdefault("cooldown_after_failures", 3)
+            a.setdefault("cooldown_minutes", 15)
+            a.setdefault("cooldown_until", 0.0)
 
     def log(self, *parts, level='INFO'):
         message = " ".join(str(p) for p in parts)
@@ -822,6 +892,26 @@ class MT5ManagerApp:
         log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.log_txt.configure(yscrollcommand=log_scroll.set)
 
+        # Dashboard Tab
+        dash_tab = ttk.Frame(notebook)
+        notebook.add(dash_tab, text="Dashboard")
+
+        dash_frame = ttk.LabelFrame(dash_tab, text="System Status")
+        dash_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+
+        # Dashboard variables and simple indicators
+        self.dash_agents_var = tk.StringVar(value="0")
+        self.dash_positions_var = tk.StringVar(value="0")
+        self.dash_disk_var = tk.StringVar(value="0 MB")
+        stat_row = ttk.Frame(dash_frame)
+        stat_row.pack(anchor=tk.NW, padx=6, pady=6)
+        ttk.Label(stat_row, text="Active Agents:").grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(stat_row, textvariable=self.dash_agents_var).grid(row=0, column=1, sticky=tk.W, padx=(6,0))
+        ttk.Label(stat_row, text="Known Positions:").grid(row=1, column=0, sticky=tk.W, pady=(6,0))
+        ttk.Label(stat_row, textvariable=self.dash_positions_var).grid(row=1, column=1, sticky=tk.W, padx=(6,0), pady=(6,0))
+        ttk.Label(dash_frame, text="Terminal Disk Usage:").grid(row=3, column=0, sticky=tk.W, padx=6, pady=4)
+        ttk.Label(dash_frame, textvariable=self.dash_disk_var).grid(row=3, column=1, sticky=tk.W)
+
     # ------------------------------------------------------------------
     #  New: Portable Terminals Setup
     # ------------------------------------------------------------------
@@ -978,6 +1068,13 @@ class MT5ManagerApp:
             except Exception:
                 pass
         del self.store["accounts"][idx]
+        # remove portable terminal folder if it was created under DATA_ROOT
+        term_path = a.get("terminal_path", "")
+        if term_path and DATA_ROOT in term_path:
+            try:
+                shutil.rmtree(Path(term_path).parent, ignore_errors=True)
+            except Exception:
+                pass
         save_store(self.store)
         self._refresh_lists()
 
@@ -1037,7 +1134,7 @@ class MT5ManagerApp:
             self.thread_log("Invalid volume", 'ERROR')
             return
         dev = int(self.deviation_var.get() or 50)
-        magic = int(self.magic_var.get() or 0)
+        base_magic = int(self.magic_var.get() or 0)
         filling = self.filling_mode_var.get()
         order_kind_ui = self.order_type_var.get()  # "market" or "pending"
         pending_type_ui = self.pending_type_var.get()  # "limit" or "stop"
@@ -1057,16 +1154,93 @@ class MT5ManagerApp:
         results = {}
         threads = []
 
+        # --- risk caps per group ---
+        group_name = accounts[0].get("group", "default") if accounts else "default"
+        max_pos_symbol, max_total_lots = self._get_group_limits(group_name)
+        current_positions = self._fetch_positions_for_accounts(accounts)
+        # count current positions for this symbol and total lots
+        current_pos_count = sum(1 for p in current_positions if p.get("symbol") == symbol)
+        current_total_lots = sum(p.get("volume", 0.0) for p in current_positions)
+
+        # pre-assign which accounts will be executed to respect caps (simple sequential allocation)
+        to_execute = []
+        for acc in accounts:
+            acc_id = str(acc.get("account"))
+            vol = compute_account_volume(acc, base_volume, self.store.get("groups", []))
+            # check per-symbol count cap
+            if max_pos_symbol and current_pos_count >= max_pos_symbol:
+                results[acc_id] = (False, "group max positions per symbol reached")
+                continue
+            # check total lots cap
+            if max_total_lots and (current_total_lots + vol) > max_total_lots:
+                results[acc_id] = (False, "group max total lots exceeded")
+                continue
+            # reserve capacity
+            current_pos_count += 1
+            current_total_lots += vol
+            to_execute.append(acc)
+
         def worker(acc):
             acc_id = str(acc.get("account"))
+            # block missing credentials early
+            if not acc.get("password") or not acc.get("server"):
+                results[acc_id] = (False, "missing password or server")
+                return
+            # cooldown check
+            if self._account_in_cooldown(acc):
+                results[acc_id] = (False, "cooldown active")
+                return
             # ensure agent running
             try:
+                base_path = self.settings.get("base_terminal_path") or self.terminal_path_var.get().strip()
+                if not acc.get("terminal_path"):
+                    new_path, err = ensure_account_terminal(acc, base_path)
+                    if new_path:
+                        acc["terminal_path"] = new_path
+                        save_store(self.store)
                 self.agent_controller.start_agent(acc)
             except Exception as e:
                 results[acc_id] = (False, f"agent start failed: {e}")
                 return
 
             volume = compute_account_volume(acc, base_volume, self.store.get("groups", []))
+
+            # per-account max positions check
+            try:
+                maxpos = int(acc.get("max_positions_per_symbol", 0))
+            except Exception:
+                maxpos = 0
+            if maxpos > 0:
+                try:
+                    okp, pos = self.agent_controller.send_command(acc_id, {"action": "get_positions"}, timeout=6)
+                    if okp and isinstance(pos, list):
+                        count = sum(1 for p in pos if p.get("symbol") == symbol)
+                        if count >= maxpos:
+                            results[acc_id] = (False, f"max positions per symbol reached ({maxpos})")
+                            return
+                except Exception:
+                    pass
+
+            # daily drawdown guard
+            try:
+                max_dd = float(acc.get("max_daily_drawdown", 0.0))
+            except Exception:
+                max_dd = 0.0
+            if max_dd and max_dd > 0:
+                try:
+                    okp, pnl = self.agent_controller.send_command(acc_id, {"action": "get_today_pnl"}, timeout=6)
+                    if okp and pnl is not None:
+                        try:
+                            if float(pnl) <= -abs(max_dd):
+                                results[acc_id] = (False, f"daily drawdown limit reached ({pnl:.2f})")
+                                return
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            magic = self._magic_for_account(base_magic, acc_id)
+            comment = self._comment_for_account(acc_id)
             cmd = {
                 "action": "place",
                 "symbol": symbol,
@@ -1076,7 +1250,7 @@ class MT5ManagerApp:
                 "sl": None,
                 "tp": None,
                 "magic": int(magic),
-                "comment": f"mt5_{acc_id}",
+                "comment": comment,
                 "filling_mode": filling,
                 "order_kind": order_kind_ui,  # "market" or "pending"
                 "pending_type": pending_type_ui,  # "limit" or "stop"
@@ -1090,8 +1264,14 @@ class MT5ManagerApp:
             except Exception as e:
                 ok, res = False, str(e)
             results[acc_id] = (ok, res)
+            if not ok:
+                try:
+                    self._mark_failure(acc)
+                    save_store(self.store)
+                except Exception:
+                    pass
 
-        for acc in accounts:
+        for acc in to_execute:
             t = threading.Thread(target=worker, args=(acc,))
             t.daemon = True
             t.start()
@@ -1219,13 +1399,19 @@ class MT5ManagerApp:
         This triggers the same work as pressing "Refresh Now" and avoids thread overlap.
         """
 
+        self._last_refresh_ts = 0.0
+
         def tick():
             try:
                 if self.auto_refresh.get() and not self.refresh_paused:
                     # only start a refresh if none is in progress
                     if not getattr(self, "_refresh_in_progress", False):
-                        # reuse the same worker used by manual refresh
-                        self.refresh_positions_now()
+                        interval = max(1.0, float(self.refresh_interval.get()))
+                        now = time.time()
+                        if now - self._last_refresh_ts >= interval:
+                            self._last_refresh_ts = now
+                            # reuse the same worker used by manual refresh
+                            self.refresh_positions_now()
                 # schedule next tick in 500 ms
                 self.root.after(500, tick)
             except Exception as e:
@@ -1251,6 +1437,12 @@ class MT5ManagerApp:
         # Ensure agents are started (start on demand)
         for acc in accounts:
             try:
+                base_path = self.settings.get("base_terminal_path") or self.terminal_path_var.get().strip()
+                if not acc.get("terminal_path"):
+                    new_path, err = ensure_account_terminal(acc, base_path)
+                    if new_path:
+                        acc["terminal_path"] = new_path
+                        save_store(self.store)
                 self.agent_controller.start_agent(acc)
             except Exception as e:
                 self.thread_log(f"Failed to start agent for {acc.get('account')}: {e}", 'ERROR')
@@ -1303,6 +1495,119 @@ class MT5ManagerApp:
                     continue
                 self.root.after(0, self._update_positions_ui, item["positions"], item["ts"])
         threading.Thread(target=processor, daemon=True).start()
+
+    def _start_dashboard_updater(self):
+        def tick():
+            try:
+                agents = self.agent_controller.active_agents() if self.agent_controller else []
+                self.dash_agents_var.set(str(len(agents)))
+                self.dash_positions_var.set(str(len(self.positions_tree.get_children())))
+                # update disk usage for DATA_ROOT/terminals
+                try:
+                    term_dir = os.path.join(DATA_ROOT, "terminals")
+                    mb = self._dir_size_mb(term_dir)
+                    self.dash_disk_var.set(f"{mb:.1f} MB")
+                except Exception:
+                    try:
+                        self.dash_disk_var.set("0 MB")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                self.root.after(1000, tick)
+            except Exception:
+                pass
+
+        try:
+            self.root.after(1000, tick)
+        except Exception:
+            pass
+
+    def _dir_size_mb(self, path):
+        total = 0
+        try:
+            for root, _, files in os.walk(path):
+                for f in files:
+                    try:
+                        fp = os.path.join(root, f)
+                        if os.path.islink(fp):
+                            continue
+                        total += os.path.getsize(fp)
+                    except Exception:
+                        continue
+        except Exception:
+            return 0.0
+        return total / (1024.0 * 1024.0)
+
+    def _get_group_limits(self, group_name):
+        g = next((x for x in self.store.get("groups", []) if x.get("name") == group_name), None)
+        if not g:
+            return 0, 0.0
+        return int(g.get("max_positions_per_symbol", 0)), float(g.get("max_total_lots", 0.0))
+
+    def _fetch_positions_for_accounts(self, accounts):
+        """Return list of positions across given accounts via agents: [{'account','symbol','volume'}, ...]"""
+        out = []
+        if not accounts or self.agent_controller is None:
+            return out
+        ids = [str(a.get("account")) for a in accounts]
+        try:
+            # ensure agents started
+            for a in accounts:
+                try:
+                    base_path = self.settings.get("base_terminal_path") or self.terminal_path_var.get().strip()
+                    if not a.get("terminal_path"):
+                        new_path, err = ensure_account_terminal(a, base_path)
+                        if new_path:
+                            a["terminal_path"] = new_path
+                            save_store(self.store)
+                    self.agent_controller.start_agent(a)
+                except Exception:
+                    continue
+            results = self.agent_controller.broadcast(ids, {"action": "get_positions"}, timeout=6)
+        except Exception:
+            return out
+        for acc_id, (ok, res) in results.items():
+            if not ok or not isinstance(res, list):
+                continue
+            for p in res:
+                try:
+                    out.append({
+                        "account": acc_id,
+                        "symbol": p.get("symbol"),
+                        "volume": float(p.get("volume", 0.0)),
+                    })
+                except Exception:
+                    continue
+        return out
+
+    def _magic_for_account(self, base_magic, acc_id):
+        try:
+            return int(base_magic) + (int(str(acc_id)) % 10000)
+        except Exception:
+            return int(base_magic)
+
+    def _comment_for_account(self, acc_id):
+        return f"mt5_{acc_id}"
+
+    def _account_in_cooldown(self, acc):
+        until = float(acc.get("cooldown_until", 0.0))
+        try:
+            return time.time() < until
+        except Exception:
+            return False
+
+    def _mark_failure(self, acc):
+        acc["fail_count"] = int(acc.get("fail_count", 0)) + 1
+        # if fail count reached threshold, set cooldown
+        try:
+            thresh = int(acc.get("cooldown_after_failures", 3))
+            mins = int(acc.get("cooldown_minutes", 15))
+            if acc.get("fail_count", 0) >= thresh:
+                acc["cooldown_until"] = time.time() + (mins * 60)
+        except Exception:
+            pass
 
     def _update_positions_ui(self, positions, ts):
         for i in self.positions_tree.get_children():
@@ -1480,6 +1785,7 @@ class MT5ManagerApp:
             'micro_delay_enabled': self.micro_delay_enabled_var.get(),
             'micro_delay_min': self.micro_delay_min_var.get(),
             'micro_delay_max': self.micro_delay_max_var.get(),
+            'base_terminal_path': self.terminal_path_var.get().strip(),
         }
         save_settings(self.settings)
         SETTINGS.update(self.settings)
@@ -1507,7 +1813,8 @@ class GroupDialog:
         self.top.transient(parent)
         self.top.grab_set()
         self.result = None
-        self.group = dict(group) if group else {"name": "", "vol_multiplier": 1.0, "forced_volume": 0.0, "active": True}
+        self.group = dict(group) if group else {"name": "", "vol_multiplier": 1.0, "forced_volume": 0.0, "active": True,
+                                               "max_positions_per_symbol": 0, "max_total_lots": 0.0}
         self._build()
 
     def _build(self):
@@ -1522,11 +1829,20 @@ class GroupDialog:
         ttk.Label(f, text="Forced volume (0=none):").grid(row=2, column=0, sticky=tk.W)
         self.forced_e = ttk.Entry(f)
         self.forced_e.grid(row=2, column=1)
+        ttk.Label(f, text="Max pos/symbol (0=none):").grid(row=3, column=0, sticky=tk.W)
+        self.maxpos_e = ttk.Entry(f)
+        self.maxpos_e.grid(row=3, column=1)
+
+        ttk.Label(f, text="Max total lots (0=none):").grid(row=4, column=0, sticky=tk.W)
+        self.maxlots_e = ttk.Entry(f)
+        self.maxlots_e.grid(row=4, column=1)
         self.active_var = tk.BooleanVar(value=self.group.get("active", True))
-        ttk.Checkbutton(f, text="Active", variable=self.active_var).grid(row=3, column=0, columnspan=2)
+        ttk.Checkbutton(f, text="Active", variable=self.active_var).grid(row=5, column=0, columnspan=2)
         self.name_e.insert(0, self.group.get("name", ""))
         self.vol_e.insert(0, str(self.group.get("vol_multiplier", 1.0)))
         self.forced_e.insert(0, str(self.group.get("forced_volume", 0.0)))
+        self.maxpos_e.insert(0, str(self.group.get("max_positions_per_symbol", 0)))
+        self.maxlots_e.insert(0, str(self.group.get("max_total_lots", 0.0)))
         ttk.Button(self.top, text="OK", command=self.ok).pack(pady=6)
 
     def ok(self):
@@ -1535,8 +1851,11 @@ class GroupDialog:
         try:
             vol = float(self.vol_e.get() or 1.0)
             forced = float(self.forced_e.get() or 0.0)
+            maxpos = int(self.maxpos_e.get() or 0)
+            maxlots = float(self.maxlots_e.get() or 0.0)
             self.result = {"name": n, "vol_multiplier": vol, "forced_volume": forced,
-                           "active": bool(self.active_var.get())}
+                           "active": bool(self.active_var.get()),
+                           "max_positions_per_symbol": maxpos, "max_total_lots": maxlots}
             self.top.destroy()
         except Exception as e:
             messagebox.showerror("Error", f"Invalid numbers: {e}")
@@ -1565,25 +1884,44 @@ class AccountDialog:
         ttk.Label(f, text="Server:").grid(row=2, column=0, sticky=tk.W)
         self.serv_e = ttk.Entry(f)
         self.serv_e.grid(row=2, column=1)
+        ttk.Label(f, text="Max pos/symbol (0=none):").grid(row=3, column=0, sticky=tk.W)
+        self.maxpos_e = ttk.Entry(f)
+        self.maxpos_e.grid(row=3, column=1)
+
+        ttk.Label(f, text="Max daily DD (0=none):").grid(row=4, column=0, sticky=tk.W)
+        self.maxdd_e = ttk.Entry(f)
+        self.maxdd_e.grid(row=4, column=1)
+
+        ttk.Label(f, text="Cooldown after failures:").grid(row=5, column=0, sticky=tk.W)
+        self.coolfails_e = ttk.Entry(f)
+        self.coolfails_e.grid(row=5, column=1)
+
+        ttk.Label(f, text="Cooldown minutes:").grid(row=6, column=0, sticky=tk.W)
+        self.coolmins_e = ttk.Entry(f)
+        self.coolmins_e.grid(row=6, column=1)
         self.active_var = tk.BooleanVar(value=self.account.get("active", True))
-        ttk.Checkbutton(f, text="Active", variable=self.active_var).grid(row=3, column=0, columnspan=2)
-        ttk.Label(f, text="Group:").grid(row=4, column=0, sticky=tk.W)
+        ttk.Checkbutton(f, text="Active", variable=self.active_var).grid(row=7, column=0, columnspan=2)
+        ttk.Label(f, text="Group:").grid(row=8, column=0, sticky=tk.W)
         self.group_var = tk.StringVar(value=self.account.get("group", "default"))
         group_names = [g["name"] for g in self.groups] or ["default"]
         self.group_cb = ttk.Combobox(f, values=group_names, textvariable=self.group_var, state="readonly")
-        self.group_cb.grid(row=4, column=1)
+        self.group_cb.grid(row=8, column=1)
 
         # New: Terminal Path
-        ttk.Label(f, text="Terminal Path:").grid(row=5, column=0, sticky=tk.W)
+        ttk.Label(f, text="Terminal Path:").grid(row=9, column=0, sticky=tk.W)
         self.path_var = tk.StringVar(value=self.account.get("terminal_path", ""))
         path_frame = ttk.Frame(f)
-        path_frame.grid(row=5, column=1, sticky=tk.EW)
+        path_frame.grid(row=9, column=1, sticky=tk.EW)
         ttk.Entry(path_frame, textvariable=self.path_var, width=40).pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(path_frame, text="Browse", command=self.browse_path).pack(side=tk.RIGHT)
 
         self.acc_e.insert(0, self.account.get("account", ""))
         self.pwd_e.insert(0, self.account.get("password", ""))
         self.serv_e.insert(0, self.account.get("server", ""))
+        self.maxpos_e.insert(0, str(self.account.get("max_positions_per_symbol", 0)))
+        self.maxdd_e.insert(0, str(self.account.get("max_daily_drawdown", 0.0)))
+        self.coolfails_e.insert(0, str(self.account.get("cooldown_after_failures", 3)))
+        self.coolmins_e.insert(0, str(self.account.get("cooldown_minutes", 15)))
         ttk.Button(self.top, text="OK", command=self.ok).pack(pady=6)
 
     def browse_path(self):
@@ -1595,6 +1933,23 @@ class AccountDialog:
     def ok(self):
         accid = self.acc_e.get().strip()
         if not accid: messagebox.showerror("Error", "Account ID required"); return
+        try:
+            maxpos = int(self.maxpos_e.get() or 0)
+        except Exception:
+            maxpos = 0
+        try:
+            maxdd = float(self.maxdd_e.get() or 0.0)
+        except Exception:
+            maxdd = 0.0
+        try:
+            coolfails = int(self.coolfails_e.get() or 3)
+        except Exception:
+            coolfails = 3
+        try:
+            coolmins = int(self.coolmins_e.get() or 15)
+        except Exception:
+            coolmins = 15
+
         self.result = {
             "name": accid,
             "account": accid,
@@ -1602,19 +1957,23 @@ class AccountDialog:
             "server": self.serv_e.get().strip(),
             "active": bool(self.active_var.get()),
             "group": self.group_var.get() or "default",
-            "terminal_path": self.path_var.get().strip()
+            "terminal_path": self.path_var.get().strip(),
+            "max_positions_per_symbol": maxpos,
+            "max_daily_drawdown": maxdd,
+            "fail_count": int(self.account.get("fail_count", 0)),
+            "cooldown_after_failures": coolfails,
+            "cooldown_minutes": coolmins,
+            "cooldown_until": float(self.account.get("cooldown_until", 0.0)),
         }
         self.top.destroy()
 
 
 def main():
+    multiprocessing.freeze_support()
     root = tk.Tk()
-    root.state("zoomed")  # Open the window in maximized state
+    root.state("zoomed")
     app = MT5ManagerApp(root)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
-    log_message("Application started")
-    root.mainloop()
-    log_message("Application closed")
 
 
 
