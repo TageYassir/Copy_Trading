@@ -1,0 +1,37 @@
+{
+  "accounts": [
+    {
+      "name": "5049720938",
+      "account": "5049720938",
+      "password": "8tSqF!Bx",
+      "server": "MetaQuotes-Demo",
+      "active": true,
+      "group": "group_5k",
+      "terminal_path": "C:\\Users\\fftt7\\Documents\\MT5_Portable\\MT5_1\\terminal64.exe"
+    },
+    {
+      "name": "106336551",
+      "account": "106336551",
+      "password": "NhJvD*A0",
+      "server": "MetaQuotes-Demo",
+      "active": true,
+      "group": "group_5k",
+      "terminal_path": "C:\\Users\\fftt7\\Documents\\MT5_Portable\\MT5_2\\terminal64.exe"
+    }
+  ],
+  "groups": [
+    {
+      "name": "default",
+      "vol_multiplier": 1.0,
+      "forced_volume": 0.0,
+      "active": true
+    },
+    {
+      "name": "group_5k",
+      "vol_multiplier": 1.0,
+      "forced_volume": 0.0,
+      "active": true
+    }
+  ],
+  "source_package": ""
+}

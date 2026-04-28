@@ -1,0 +1,18 @@
+{
+  "init_delay": 0.5,
+  "login_delay": 0.5,
+  "trade_delay": 0.5,
+  "shutdown_delay": 0.5,
+  "between_accounts_delay": 0.5,
+  "retry_delay": 0.5,
+  "max_retries": 2,
+  "positions_refresh_interval": 1.0,
+  "auto_refresh_positions": false,
+  "debug_mode": true,
+  "filling_mode": "FOK",
+  "lot_jitter_enabled": true,
+  "lot_jitter_percent": 2.0,
+  "micro_delay_enabled": true,
+  "micro_delay_min": 0.1,
+  "micro_delay_max": 0.5
+}
