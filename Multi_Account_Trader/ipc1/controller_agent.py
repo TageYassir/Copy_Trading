@@ -15,6 +15,7 @@ try:
 except Exception:
     agent_module = None
 
+
 # Each agent has (process, cmd_queue, resp_queue)
 class ControllerAgent:
     def __init__(self):

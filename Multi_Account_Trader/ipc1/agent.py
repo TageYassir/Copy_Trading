@@ -26,9 +26,31 @@ except Exception:
 # ----------------- Logging -----------------
 def setup_logger(account_id, agent_root=None):
     log = logging.getLogger(f"agent_{account_id}")
-    log.setLevel(logging.DEBUG)
+    # If logger already configured, return it
     if log.handlers:
         return log
+    log.setLevel(logging.DEBUG)
+    fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    # Console handler (INFO+)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
+    log.addHandler(ch)
+    # File handler per-account (DEBUG+)
+    try:
+        root = Path(get_data_root()) / "ipc1" / "agent_logs"
+        root.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(root / f"agent_{account_id}.log", encoding='utf-8')
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(fmt)
+        log.addHandler(fh)
+    except Exception:
+        # best-effort: if file handler cannot be created, continue with console handler
+        try:
+            log.exception("Failed to create file handler for agent logger")
+        except Exception:
+            pass
+    return log
     
 
 
@@ -278,8 +300,13 @@ def place_order_local(symbol, side, volume, deviation=50, price=None, sl=0.0, tp
         res = mt5.order_send(req)
         if res is None:
             return False, "order_send returned None"
-
         retcode = int(getattr(res, "retcode", -1))
+        # Helpful log for AutoTrading-disabled case
+        try:
+            if retcode == 10027 and logger:
+                logger.warning(f"MT5 returned retcode 10027: AutoTrading disabled for symbol {symbol}")
+        except Exception:
+            pass
         # 10009 = DONE, 10008 = PLACED (pending)
         if retcode in (10009, 10008):
             return True, serialize_mt5_result(res)
@@ -456,6 +483,15 @@ def agent_main(cmd_q, resp_q, account_cfg):
                 cmd = cmd_q.get(timeout=0.5)
             except Exception:
                 cmd = None
+
+            # If a global shutdown sentinel exists, exit promptly (helpful if controller failed)
+            try:
+                stop_marker = Path(get_data_root()) / "ipc1" / "STOP_AGENTS"
+                if stop_marker.exists():
+                    logger.info("Shutdown sentinel detected; agent exiting")
+                    break
+            except Exception:
+                pass
 
             now = time.time()
             # auto‑refresh login if connection dropped

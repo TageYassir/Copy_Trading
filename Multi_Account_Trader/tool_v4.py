@@ -26,6 +26,8 @@ import multiprocessing
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+import sys
+sys.path.insert(0, r'D:\Trading_copier')
 
 try:
     import MetaTrader5 as mt5
@@ -35,8 +37,14 @@ except Exception:
 # New imports for agent architecture
 try:
     from Multi_Account_Trader.ipc1.controller_agent import ControllerAgent
-except Exception:
+except Exception as e:
     ControllerAgent = None
+    import traceback as _tb
+    try:
+        print("ControllerAgent import failed:", e, file=sys.stderr)
+        print(_tb.format_exc(), file=sys.stderr)
+    except Exception:
+        pass
 
 def get_data_root():
     """Return application data root.
@@ -706,6 +714,10 @@ class MT5ManagerApp:
         ttk.Button(top_controls, text="Browse...", command=self.browse_terminal).pack(side=tk.LEFT)
         # NEW button to setup portable terminals
         ttk.Button(top_controls, text="Setup Portable Terminals", command=self.setup_portable_terminals).pack(side=tk.LEFT, padx=10)
+        # Kill Terminals button: terminate all MT5 terminal processes
+        ttk.Button(top_controls, text="Kill Terminals", command=self.kill_all_terminals).pack(side=tk.RIGHT, padx=6)
+        # Force Quit button: attempts graceful shutdown, then hard-exits if needed
+        ttk.Button(top_controls, text="Force Quit", command=self.force_quit).pack(side=tk.RIGHT, padx=6)
 
         paned = ttk.PanedWindow(main, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True)
@@ -1284,8 +1296,23 @@ class MT5ManagerApp:
             results[acc_id] = (ok, res)
             if not ok:
                 try:
-                    self._mark_failure(acc)
-                    save_store(self.store)
+                    # Do not count MT5 AutoTrading-disabled (retcode 10027) as a failure
+                    skip_failure = False
+                    try:
+                        if isinstance(res, dict) and int(res.get('retcode', 0)) == 10027:
+                            skip_failure = True
+                    except Exception:
+                        pass
+                    try:
+                        if isinstance(res, str) and ('AutoTrading disabled' in res or '10027' in res):
+                            skip_failure = True
+                    except Exception:
+                        pass
+                    if not skip_failure:
+                        self._mark_failure(acc)
+                        save_store(self.store)
+                    else:
+                        self.thread_log(f"[{acc_id}] Skipping failure count for AutoTrading disabled", 'INFO')
                 except Exception:
                     pass
 
@@ -1815,11 +1842,146 @@ class MT5ManagerApp:
         # stop agents gracefully
         try:
             if self.agent_controller:
-                self.agent_controller.stop_all()
+                # create a shutdown sentinel that agents watch for as a fallback
+                try:
+                    stop_marker = Path(DATA_ROOT) / "ipc1" / "STOP_AGENTS"
+                    stop_marker.parent.mkdir(parents=True, exist_ok=True)
+                    stop_marker.touch()
+                    self.thread_log("Created agent shutdown sentinel", 'DEBUG')
+                except Exception:
+                    pass
+                try:
+                    self.agent_controller.stop_all()
+                finally:
+                    try:
+                        stop_marker.unlink()
+                    except Exception:
+                        pass
         except Exception:
             pass
         safe_shutdown_mt5()
         self.root.destroy()
+
+    def force_quit(self):
+        """Attempt a graceful shutdown; if it stalls, forcefully exit the process."""
+        try:
+            self.thread_log("Force quit requested", 'WARNING')
+            # disable automatic refresh and stop agents
+            self.refresh_paused = True
+            self.auto_refresh.set(False)
+            try:
+                if self.agent_controller:
+                    # try a graceful stop first
+                    # create sentinel to ensure agents exit even if queue communication fails
+                    try:
+                        stop_marker = Path(DATA_ROOT) / "ipc1" / "STOP_AGENTS"
+                        stop_marker.parent.mkdir(parents=True, exist_ok=True)
+                        stop_marker.touch()
+                    except Exception:
+                        stop_marker = None
+                    try:
+                        self.agent_controller.stop_all()
+                    except Exception:
+                        pass
+                    finally:
+                        try:
+                            if stop_marker is not None and stop_marker.exists():
+                                stop_marker.unlink()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            try:
+                save_store(self.store)
+            except Exception:
+                pass
+            try:
+                safe_shutdown_mt5()
+            except Exception:
+                pass
+            # give a short time for threads/processes to wind down, then hard exit
+            def _hard_exit():
+                try:
+                    time.sleep(1.0)
+                except Exception:
+                    pass
+                try:
+                    os._exit(0)
+                except Exception:
+                    try:
+                        sys.exit(0)
+                    except Exception:
+                        pass
+
+            threading.Thread(target=_hard_exit, daemon=True).start()
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                log_message(f"Force quit error: {e}", 'ERROR')
+            except Exception:
+                pass
+
+    def kill_all_terminals(self):
+        """Terminate all known terminal processes for configured accounts."""
+        if not messagebox.askyesno("Kill Terminals", "Kill all MT5 terminal processes? This will force-close any open MT5 terminals."):
+            return
+        def _worker():
+            # Stop agent processes first to avoid them restarting terminals
+            try:
+                self.thread_log("Stopping agent processes before killing terminals...", 'INFO')
+                if self.agent_controller:
+                    try:
+                        self.agent_controller.stop_all()
+                    except Exception as e:
+                        self.thread_log(f"AgentController.stop_all() error: {e}", 'ERROR')
+                time.sleep(0.5)
+            except Exception:
+                pass
+
+            # collect executable basenames from accounts
+            names = set()
+            try:
+                for a in self.store.get('accounts', []):
+                    tp = (a.get('terminal_path') or '').strip()
+                    if not tp:
+                        tp = self.terminal_path_var.get().strip()
+                    if tp:
+                        names.add(os.path.basename(tp).lower())
+            except Exception:
+                pass
+            # fallback common names
+            if not names:
+                names.update({'terminal64.exe', 'terminal.exe'})
+
+            results = []
+            for nm in list(names):
+                try:
+                    if os.name == 'nt':
+                        # taskkill by image name
+                        proc = subprocess.run(["taskkill", "/F", "/IM", nm], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                        ok = proc.returncode == 0
+                        out = proc.stdout.strip() + '\n' + proc.stderr.strip()
+                        results.append((nm, ok, out))
+                    else:
+                        # POSIX: try pkill by name
+                        proc = subprocess.run(["pkill", "-f", nm], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                        ok = proc.returncode in (0, 1)  # 1 = no process matched
+                        out = proc.stdout.strip() + '\n' + proc.stderr.strip()
+                        results.append((nm, ok, out))
+                except Exception as e:
+                    results.append((nm, False, str(e)))
+
+            # Log results
+            for nm, ok, out in results:
+                if ok:
+                    self.thread_log(f"Kill {nm}: success", 'INFO')
+                else:
+                    self.thread_log(f"Kill {nm}: failed - {out}", 'ERROR')
+
+        threading.Thread(target=_worker, daemon=True).start()
 
 
 # ----------------------------------------------------------------------
@@ -1989,11 +2151,33 @@ class AccountDialog:
 def main():
     multiprocessing.freeze_support()
     root = tk.Tk()
+    # Try to load an application icon. Look in DATA_ROOT/assets and package assets.
+    try:
+        icon_candidates = [
+            os.path.join(DATA_ROOT, "assets", "app_icon.ico"),
+            os.path.join(os.path.dirname(__file__), "assets", "app_icon.ico"),
+            os.path.join(DATA_ROOT, "assets", "app_icon.png"),
+            os.path.join(os.path.dirname(__file__), "assets", "app_icon.png"),
+        ]
+        for ip in icon_candidates:
+            if os.path.exists(ip):
+                try:
+                    if ip.lower().endswith('.ico') and os.name == 'nt':
+                        root.iconbitmap(ip)
+                    else:
+                        img = tk.PhotoImage(file=ip)
+                        root.iconphoto(False, img)
+                except Exception:
+                    # ignore and try next candidate
+                    continue
+                break
+    except Exception:
+        pass
+
     root.state("zoomed")
     app = MT5ManagerApp(root)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
-
-
+    root.mainloop()
 
 
 if __name__ == "__main__":
