@@ -415,7 +415,8 @@ def ensure_portable_and_start(terminal_path, logger, start_terminal=True):
         else:
             proc = subprocess.Popen([str(tpath)], cwd=str(tdir))
         logger.info(f"Started terminal process PID={proc.pid} for {tdir}")
-        time.sleep(2.0)
+        # allow more time for the terminal to fully initialize (Windows can be slow)
+        time.sleep(6.0)
         return proc, None
     except Exception as e:
         logger.error(f"Failed to start terminal exe: {e}")
@@ -427,6 +428,9 @@ def agent_main(cmd_q, resp_q, account_cfg):
     account_id = str(account_cfg.get("account", "unknown"))
     logger = setup_logger(account_id)
     logger.info(f"Agent starting for account {account_id}")
+
+    # record agent start time to ignore stale STOP_AGENTS markers
+    agent_start_ts = time.time()
 
     terminal_path = account_cfg.get("terminal_path", "") or ""
     proc_started = None
@@ -466,8 +470,9 @@ def agent_main(cmd_q, resp_q, account_cfg):
             logger.error(f"connect exception: {e}\n{traceback.format_exc()}")
             return False, str(e)
 
+    # more aggressive connect retries to allow terminal enough time to be ready
     backoff = 1.0
-    for _ in range(5):
+    for _ in range(12):
         ok, err = try_connect()
         if ok:
             break
@@ -488,8 +493,33 @@ def agent_main(cmd_q, resp_q, account_cfg):
             try:
                 stop_marker = Path(get_data_root()) / "ipc1" / "STOP_AGENTS"
                 if stop_marker.exists():
-                    logger.info("Shutdown sentinel detected; agent exiting")
-                    break
+                    try:
+                        mtime = stop_marker.stat().st_mtime
+                        logger.debug(f"STOP_AGENTS exists: mtime={mtime}, agent_start_ts={agent_start_ts}")
+                        # If sentinel appears to be newer than agent start, wait briefly to avoid races
+                        if mtime >= agent_start_ts:
+                            # ignore sentinel during initial agent startup/upramp to avoid races
+                            uptime = time.time() - agent_start_ts
+                            if uptime < 10.0:
+                                logger.info(f"Detected STOP_AGENTS but agent uptime {uptime:.1f}s < 10s; ignoring")
+                            else:
+                                # wait up to 3 seconds for the sentinel to be removed (race with controller)
+                                waited = 0.0
+                                while stop_marker.exists() and waited < 3.0:
+                                    time.sleep(0.2)
+                                    waited += 0.2
+                                if stop_marker.exists():
+                                    logger.info("Shutdown sentinel detected after grace period; agent exiting")
+                                    break
+                                else:
+                                    logger.info("Shutdown sentinel removed during grace period; continuing")
+                        else:
+                            # stale sentinel: ignore
+                            logger.debug("Ignoring stale STOP_AGENTS marker")
+                    except Exception:
+                        # if we can't stat the file, err on the side of stopping
+                        logger.info("Shutdown sentinel detected; agent exiting")
+                        break
             except Exception:
                 pass
 

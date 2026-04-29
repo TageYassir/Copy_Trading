@@ -946,63 +946,55 @@ class MT5ManagerApp:
     #  New: Portable Terminals Setup
     # ------------------------------------------------------------------
     def setup_portable_terminals(self):
-        base_path = self.terminal_path_var.get().strip()
-        if not base_path:
-            self.browse_terminal()
-            base_path = self.terminal_path_var.get().strip()
-            if not base_path:
-                messagebox.showerror("Error", "Please select a base terminal executable first.")
-                return
-        base_exe = Path(base_path)
-        if not base_exe.is_file():
-            messagebox.showerror("Error", "Base terminal executable not found.")
-            return
-        base_dir = base_exe.parent
+        # Use selected accounts if any; otherwise use active accounts
+        sel = self.accounts_tree.selection()
+        if sel:
+            accounts = [self.store['accounts'][int(i)] for i in sel]
+        else:
+            accounts = self.get_active_accounts()
 
-        accounts = self.get_active_accounts()
         if not accounts:
-            messagebox.showinfo("Info", "No active accounts to setup.")
+            messagebox.showinfo("Info", "No accounts selected or active to setup.")
             return
 
-        target_root = Path.home() / "Documents" / "MT5_Portable"
+        # Ensure we have a fallback global base terminal path
+        base_global = self.terminal_path_var.get().strip() or self.settings.get('base_terminal_path', '').strip()
+        if not base_global:
+            # prompt user to choose a fallback base if no per-account path is set
+            self.browse_terminal()
+            base_global = self.terminal_path_var.get().strip()
+
+        target_root = Path(DATA_ROOT) / "MT5_Portable"
         target_root.mkdir(parents=True, exist_ok=True)
 
         if not messagebox.askyesno("Confirm",
-                                   f"This will copy the MT5 folder to\n{target_root}\nfor {len(accounts)} accounts. Continue?"):
+                                   f"This will create portable terminal copies under\n{target_root}\nfor {len(accounts)} accounts. Continue?"):
             return
 
         self.thread_log(f"Target folder: {target_root}")
-        for i, acc in enumerate(accounts, start=1):
-            target_dir = target_root / f"MT5_{i}"
+        for acc in accounts:
             try:
-                if not target_dir.exists():
-                    shutil.copytree(str(base_dir), str(target_dir))
-                    self.thread_log(f"Created: {target_dir}")
-                    # --- NEW: enable portable mode ---
-                    portable_marker = target_dir / "portable.dat"
-                    portable_marker.touch()  # creates empty file
-                    self.thread_log(f"Set portable mode for {target_dir}")
+                # prefer account-specific source if provided and valid
+                acc_source = (acc.get('terminal_path') or '').strip()
+                source_path = acc_source or base_global
+                if not source_path:
+                    self.thread_log(f"Skipping account {acc.get('account')}: no source terminal specified", 'WARNING')
+                    continue
+                # call ensure_account_terminal which clones under DATA_ROOT/MT5_Portable and returns executable path
+                new_exe, err = ensure_account_terminal(acc, source_path)
+                if new_exe:
+                    acc['terminal_path'] = new_exe
+                    save_store(self.store)
+                    self.thread_log(f"[{acc.get('account')}] Portable terminal ready: {new_exe}")
                 else:
-                    self.thread_log(f"Already exists: {target_dir}")
-                    # Also ensure portable.dat exists for existing folders
-                    portable_marker = target_dir / "portable.dat"
-                    if not portable_marker.exists():
-                        portable_marker.touch()
-                        self.thread_log(f"Added missing portable.dat to {target_dir}")
-
-                terminal_exe = target_dir / "terminal64.exe"
-                if not terminal_exe.exists():
-                    terminal_exe = target_dir / "terminal.exe"
-                if terminal_exe.exists():
-                    acc["terminal_path"] = str(terminal_exe)
-                    self.thread_log(f"Set path: {acc['terminal_path']}")
-                else:
-                    self.thread_log(f"WARNING: No terminal.exe found in {target_dir}", 'WARNING')
+                    self.thread_log(f"[{acc.get('account')}] Failed to create portable terminal: {err}", 'ERROR')
             except Exception as e:
-                self.thread_log(f"Error for {acc['account']}: {e}", 'ERROR')
+                self.thread_log(f"Error for {acc.get('account')}: {e}", 'ERROR')
+
+        # refresh UI and persist store
         save_store(self.store)
         self._refresh_lists()
-        self.thread_log("Portable terminals created with portable mode.")
+        self.thread_log("Portable terminals created/updated for selected accounts.")
 
     # ------------------------------------------------------------------
     #  Data store & UI refresh
@@ -1296,15 +1288,15 @@ class MT5ManagerApp:
             results[acc_id] = (ok, res)
             if not ok:
                 try:
-                    # Do not count MT5 AutoTrading-disabled (retcode 10027) as a failure
+                    # Do not count AutoTrading-disabled retcodes as failures (support 10026 and 10027)
                     skip_failure = False
                     try:
-                        if isinstance(res, dict) and int(res.get('retcode', 0)) == 10027:
+                        if isinstance(res, dict) and int(res.get('retcode', 0)) in (10026, 10027):
                             skip_failure = True
                     except Exception:
                         pass
                     try:
-                        if isinstance(res, str) and ('AutoTrading disabled' in res or '10027' in res):
+                        if isinstance(res, str) and (('AutoTrading disabled' in res) or any(code in res for code in ('10026', '10027'))):
                             skip_failure = True
                     except Exception:
                         pass
@@ -1312,7 +1304,7 @@ class MT5ManagerApp:
                         self._mark_failure(acc)
                         save_store(self.store)
                     else:
-                        self.thread_log(f"[{acc_id}] Skipping failure count for AutoTrading disabled", 'INFO')
+                        self.thread_log(f"[{acc_id}] Skipping failure count for AutoTrading disabled (retcode may be 10026/10027)", 'INFO')
                 except Exception:
                     pass
 
