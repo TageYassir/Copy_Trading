@@ -714,10 +714,6 @@ class MT5ManagerApp:
         ttk.Button(top_controls, text="Browse...", command=self.browse_terminal).pack(side=tk.LEFT)
         # NEW button to setup portable terminals
         ttk.Button(top_controls, text="Setup Portable Terminals", command=self.setup_portable_terminals).pack(side=tk.LEFT, padx=10)
-        # Kill Terminals button: terminate all MT5 terminal processes
-        ttk.Button(top_controls, text="Kill Terminals", command=self.kill_all_terminals).pack(side=tk.RIGHT, padx=6)
-        # Force Quit button: attempts graceful shutdown, then hard-exits if needed
-        ttk.Button(top_controls, text="Force Quit", command=self.force_quit).pack(side=tk.RIGHT, padx=6)
 
         paned = ttk.PanedWindow(main, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True)
@@ -1325,7 +1321,22 @@ class MT5ManagerApp:
                 self.thread_log(f"[{acc_id}] Trade OK")
                 success_count += 1
             else:
-                self.thread_log(f"[{acc_id}] Failure: {detail}", 'ERROR')
+                # Treat AutoTrading-disabled retcodes (10026/10027) as informational
+                skip_err = False
+                try:
+                    if isinstance(detail, dict) and int(detail.get('retcode', 0)) in (10026, 10027):
+                        skip_err = True
+                except Exception:
+                    pass
+                try:
+                    if not skip_err and isinstance(detail, str) and (('AutoTrading disabled' in detail) or any(code in detail for code in ('10026', '10027'))):
+                        skip_err = True
+                except Exception:
+                    pass
+                if skip_err:
+                    self.thread_log(f"[{acc_id}] Failure (AutoTrading disabled): {detail}", 'INFO')
+                else:
+                    self.thread_log(f"[{acc_id}] Failure: {detail}", 'ERROR')
 
         self.thread_log(f"Trade batch complete: {success_count}/{n} succeeded.")
 
@@ -1800,6 +1811,38 @@ class MT5ManagerApp:
             if not any_accounts:
                 self.thread_log("No accounts configured in store.", 'WARNING')
 
+            # Query agents for AutoTrading status (account.trade_allowed and terminal_info)
+            if self.agent_controller:
+                try:
+                    accounts = self.get_active_accounts()
+                    ids = [str(a.get("account")) for a in accounts]
+                    # ensure agents started
+                    for a in accounts:
+                        try:
+                            self.agent_controller.start_agent(a)
+                        except Exception:
+                            pass
+                    if ids:
+                        try:
+                            results = self.agent_controller.broadcast(ids, {"action": "get_autotrade"}, timeout=6)
+                            for acc_id, (ok, res) in results.items():
+                                if not ok:
+                                    self.thread_log(f"{acc_id}: autotrade status error: {res}", 'DEBUG')
+                                    continue
+                                if isinstance(res, dict):
+                                    at = res.get('account_trade_allowed', None)
+                                    if at is False:
+                                        self.thread_log(f"{acc_id}: AutoTrading disabled by server (account.trade_allowed=False)", 'WARNING')
+                                    elif at is True:
+                                        self.thread_log(f"{acc_id}: AutoTrading appears enabled", 'DEBUG')
+                                    else:
+                                        # unknown; show terminal info summary as DEBUG
+                                        self.thread_log(f"{acc_id}: AutoTrading status unknown; terminal_info: {res.get('terminal_info')}", 'DEBUG')
+                        except Exception as e:
+                            self.thread_log(f"AutoTrading status query failed: {e}", 'ERROR')
+                except Exception:
+                    pass
+
             self.thread_log("Startup checks complete.", 'DEBUG')
         except Exception as e:
             self.thread_log(f"Startup checks failed: {e}", 'ERROR')
@@ -1831,149 +1874,25 @@ class MT5ManagerApp:
     def on_closing(self):
         self.refresh_paused = True
         self.auto_refresh.set(False)
-        # stop agents gracefully
+        # stop agents gracefully (do NOT create a global STOP_AGENTS sentinel)
         try:
             if self.agent_controller:
-                # create a shutdown sentinel that agents watch for as a fallback
-                try:
-                    stop_marker = Path(DATA_ROOT) / "ipc1" / "STOP_AGENTS"
-                    stop_marker.parent.mkdir(parents=True, exist_ok=True)
-                    stop_marker.touch()
-                    self.thread_log("Created agent shutdown sentinel", 'DEBUG')
-                except Exception:
-                    pass
                 try:
                     self.agent_controller.stop_all()
-                finally:
-                    try:
-                        stop_marker.unlink()
-                    except Exception:
-                        pass
+                except Exception:
+                    pass
         except Exception:
             pass
         safe_shutdown_mt5()
         self.root.destroy()
 
     def force_quit(self):
-        """Attempt a graceful shutdown; if it stalls, forcefully exit the process."""
-        try:
-            self.thread_log("Force quit requested", 'WARNING')
-            # disable automatic refresh and stop agents
-            self.refresh_paused = True
-            self.auto_refresh.set(False)
-            try:
-                if self.agent_controller:
-                    # try a graceful stop first
-                    # create sentinel to ensure agents exit even if queue communication fails
-                    try:
-                        stop_marker = Path(DATA_ROOT) / "ipc1" / "STOP_AGENTS"
-                        stop_marker.parent.mkdir(parents=True, exist_ok=True)
-                        stop_marker.touch()
-                    except Exception:
-                        stop_marker = None
-                    try:
-                        self.agent_controller.stop_all()
-                    except Exception:
-                        pass
-                    finally:
-                        try:
-                            if stop_marker is not None and stop_marker.exists():
-                                stop_marker.unlink()
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-            try:
-                save_store(self.store)
-            except Exception:
-                pass
-            try:
-                safe_shutdown_mt5()
-            except Exception:
-                pass
-            # give a short time for threads/processes to wind down, then hard exit
-            def _hard_exit():
-                try:
-                    time.sleep(1.0)
-                except Exception:
-                    pass
-                try:
-                    os._exit(0)
-                except Exception:
-                    try:
-                        sys.exit(0)
-                    except Exception:
-                        pass
-
-            threading.Thread(target=_hard_exit, daemon=True).start()
-            try:
-                self.root.destroy()
-            except Exception:
-                pass
-        except Exception as e:
-            try:
-                log_message(f"Force quit error: {e}", 'ERROR')
-            except Exception:
-                pass
+        # Force-quit functionality removed from UI; keep method stub for compatibility.
+        self.thread_log("force_quit() called but functionality is removed.", 'WARNING')
 
     def kill_all_terminals(self):
-        """Terminate all known terminal processes for configured accounts."""
-        if not messagebox.askyesno("Kill Terminals", "Kill all MT5 terminal processes? This will force-close any open MT5 terminals."):
-            return
-        def _worker():
-            # Stop agent processes first to avoid them restarting terminals
-            try:
-                self.thread_log("Stopping agent processes before killing terminals...", 'INFO')
-                if self.agent_controller:
-                    try:
-                        self.agent_controller.stop_all()
-                    except Exception as e:
-                        self.thread_log(f"AgentController.stop_all() error: {e}", 'ERROR')
-                time.sleep(0.5)
-            except Exception:
-                pass
-
-            # collect executable basenames from accounts
-            names = set()
-            try:
-                for a in self.store.get('accounts', []):
-                    tp = (a.get('terminal_path') or '').strip()
-                    if not tp:
-                        tp = self.terminal_path_var.get().strip()
-                    if tp:
-                        names.add(os.path.basename(tp).lower())
-            except Exception:
-                pass
-            # fallback common names
-            if not names:
-                names.update({'terminal64.exe', 'terminal.exe'})
-
-            results = []
-            for nm in list(names):
-                try:
-                    if os.name == 'nt':
-                        # taskkill by image name
-                        proc = subprocess.run(["taskkill", "/F", "/IM", nm], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                        ok = proc.returncode == 0
-                        out = proc.stdout.strip() + '\n' + proc.stderr.strip()
-                        results.append((nm, ok, out))
-                    else:
-                        # POSIX: try pkill by name
-                        proc = subprocess.run(["pkill", "-f", nm], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                        ok = proc.returncode in (0, 1)  # 1 = no process matched
-                        out = proc.stdout.strip() + '\n' + proc.stderr.strip()
-                        results.append((nm, ok, out))
-                except Exception as e:
-                    results.append((nm, False, str(e)))
-
-            # Log results
-            for nm, ok, out in results:
-                if ok:
-                    self.thread_log(f"Kill {nm}: success", 'INFO')
-                else:
-                    self.thread_log(f"Kill {nm}: failed - {out}", 'ERROR')
-
-        threading.Thread(target=_worker, daemon=True).start()
+        # Kill-terminals functionality removed from UI; keep method stub for compatibility.
+        self.thread_log("kill_all_terminals() called but functionality is removed.", 'WARNING')
 
 
 # ----------------------------------------------------------------------

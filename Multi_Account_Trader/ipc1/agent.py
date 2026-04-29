@@ -429,11 +429,26 @@ def agent_main(cmd_q, resp_q, account_cfg):
     logger = setup_logger(account_id)
     logger.info(f"Agent starting for account {account_id}")
 
+    try:
+        logger.info(f"Agent module file: {__file__} | pid={os.getpid()} | python={sys.executable}")
+    except Exception:
+        try:
+            logger.info(f"Agent started (module path unknown) | pid={os.getpid()}")
+        except Exception:
+            pass
+
     # record agent start time to ignore stale STOP_AGENTS markers
     agent_start_ts = time.time()
 
     terminal_path = account_cfg.get("terminal_path", "") or ""
     proc_started = None
+
+    # sentinel file (legacy shutdown mechanism) — ignore it to avoid premature exits
+    try:
+        from pathlib import Path as _Path
+        _SENTINEL_PATH = _Path(get_data_root()) / "STOP_AGENTS"
+    except Exception:
+        _SENTINEL_PATH = None
 
     if terminal_path:
         proc, err = ensure_portable_and_start(terminal_path, logger, start_terminal=True)
@@ -489,39 +504,14 @@ def agent_main(cmd_q, resp_q, account_cfg):
             except Exception:
                 cmd = None
 
-            # If a global shutdown sentinel exists, exit promptly (helpful if controller failed)
+            # Legacy: some external tools create a STOP_AGENTS file to signal shutdown.
+            # Ignore this marker here to keep agents running until explicitly asked via IPC.
             try:
-                stop_marker = Path(get_data_root()) / "ipc1" / "STOP_AGENTS"
-                if stop_marker.exists():
-                    try:
-                        mtime = stop_marker.stat().st_mtime
-                        logger.debug(f"STOP_AGENTS exists: mtime={mtime}, agent_start_ts={agent_start_ts}")
-                        # If sentinel appears to be newer than agent start, wait briefly to avoid races
-                        if mtime >= agent_start_ts:
-                            # ignore sentinel during initial agent startup/upramp to avoid races
-                            uptime = time.time() - agent_start_ts
-                            if uptime < 10.0:
-                                logger.info(f"Detected STOP_AGENTS but agent uptime {uptime:.1f}s < 10s; ignoring")
-                            else:
-                                # wait up to 3 seconds for the sentinel to be removed (race with controller)
-                                waited = 0.0
-                                while stop_marker.exists() and waited < 3.0:
-                                    time.sleep(0.2)
-                                    waited += 0.2
-                                if stop_marker.exists():
-                                    logger.info("Shutdown sentinel detected after grace period; agent exiting")
-                                    break
-                                else:
-                                    logger.info("Shutdown sentinel removed during grace period; continuing")
-                        else:
-                            # stale sentinel: ignore
-                            logger.debug("Ignoring stale STOP_AGENTS marker")
-                    except Exception:
-                        # if we can't stat the file, err on the side of stopping
-                        logger.info("Shutdown sentinel detected; agent exiting")
-                        break
+                if _SENTINEL_PATH is not None and _SENTINEL_PATH.exists():
+                    logger.info("STOP_AGENTS marker present — ignoring for this agent (keeping running)")
             except Exception:
                 pass
+            
 
             now = time.time()
             # auto‑refresh login if connection dropped
@@ -643,6 +633,44 @@ def agent_main(cmd_q, resp_q, account_cfg):
                     resp_q.put({"id": cid, "status": "ok", "result": pos})
                 except Exception:
                     pass
+                continue
+
+            # GET AUTOTRADE STATUS
+            if action == "get_autotrade":
+                if not connected:
+                    ok, err = try_connect()
+                    if not ok:
+                        try:
+                            resp_q.put({"id": cid, "status": "error", "error": f"not connected: {err}"})
+                        except Exception:
+                            pass
+                        continue
+                # collect account_info and terminal_info safely
+                try:
+                    ai = mt5.account_info()
+                except Exception:
+                    ai = None
+                try:
+                    ti = mt5.terminal_info()
+                except Exception:
+                    ti = None
+                try:
+                    out = {
+                        "account_trade_allowed": None,
+                        "account_info": deep_serialize(ai),
+                        "terminal_info": deep_serialize(ti),
+                    }
+                    if ai is not None:
+                        try:
+                            out["account_trade_allowed"] = bool(getattr(ai, "trade_allowed", None))
+                        except Exception:
+                            out["account_trade_allowed"] = None
+                    resp_q.put({"id": cid, "status": "ok", "result": out})
+                except Exception:
+                    try:
+                        resp_q.put({"id": cid, "status": "error", "error": "failed to collect autotrade status"})
+                    except Exception:
+                        pass
                 continue
 
             if action == "get_today_pnl":
