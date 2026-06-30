@@ -1,4 +1,10 @@
 # MT5 Manager – Multi Account Trader with Group Trading  
+
+## 🤝 Contributors
+| Avatar | Contributor |
+| :---: | :--- |
+| <img src="https://github.com/TageYassir.png" width="40px;"/> | **Yassir Tagemouati** [@yassir](https://github.com/TageYassir) |
+
 ### Prop‑Firm Safe Edition
 
 **MT5 Manager** is a professional multi‑account trade copier for MetaTrader 5, built with safety and reliability at its core. It uses per‑account **agent processes** (multiprocessing) to maintain independent, persistent MT5 sessions – eliminating login bursts, library cross‑talk, and single‑point‑of‑failure. Designed for **prop‑firm challenges** and multi‑account management, it includes intelligent anti‑ban features, risk controls, and an easy‑to‑use GUI.
