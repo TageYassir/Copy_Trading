@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Per-account Agent process for persistent MT5 connection (complete with CSV trade logging).
+Per-account Agent process for persistent MT5 connection (hardened).
 
 Writes per-account CSV at: ipc1/agent_logs/trades_<account>.csv
 Columns: timestamp,event,ticket,symbol,side,volume,price,comment,extra
@@ -16,74 +16,86 @@ import traceback
 import subprocess
 from pathlib import Path
 import datetime
+import math
+import site
+
+# Inherit parent env paths for spawned process
+for p in site.getsitepackages():
+    if p not in sys.path:
+        sys.path.append(p)
+
+user_site = site.getusersitepackages()
+if user_site and user_site not in sys.path:
+    sys.path.append(user_site)
 
 try:
     import MetaTrader5 as mt5
-except Exception:
+except Exception as e:
     mt5 = None
+    _MT5_IMPORT_ERROR = str(e)
+else:
+    _MT5_IMPORT_ERROR = None
+
+
+# ----------------- app paths -----------------
+def get_data_root():
+    env_root = os.environ.get("TRADING_SYSTEM_DATA_DIR", "").strip()
+    if env_root:
+        return env_root
+    if os.name == "nt":
+        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+    else:
+        base = os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "Trading_System")
 
 
 # ----------------- Logging -----------------
-def setup_logger(account_id, agent_root=None):
+def setup_logger(account_id):
     log = logging.getLogger(f"agent_{account_id}")
-    # If logger already configured, return it
     if log.handlers:
         return log
     log.setLevel(logging.DEBUG)
     fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    # Console handler (INFO+)
+
     ch = logging.StreamHandler()
     ch.setLevel(logging.INFO)
     ch.setFormatter(fmt)
     log.addHandler(ch)
-    # File handler per-account (DEBUG+)
+
     try:
         root = Path(get_data_root()) / "ipc1" / "agent_logs"
         root.mkdir(parents=True, exist_ok=True)
-        fh = logging.FileHandler(root / f"agent_{account_id}.log", encoding='utf-8')
+        fh = logging.FileHandler(root / f"agent_{account_id}.log", encoding="utf-8")
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(fmt)
         log.addHandler(fh)
     except Exception:
-        # best-effort: if file handler cannot be created, continue with console handler
         try:
-            log.exception("Failed to create file handler for agent logger")
+            log.exception("Failed to setup file logger")
         except Exception:
             pass
     return log
-    
 
 
 # ----------------- Safe serialization -----------------
 def is_primitive(obj):
     return obj is None or isinstance(obj, (str, int, float, bool))
 
+
 def deep_serialize(obj):
     try:
         if is_primitive(obj):
             return obj
         if isinstance(obj, dict):
-            out = {}
-            for k, v in obj.items():
-                try:
-                    ks = str(k)
-                except Exception:
-                    ks = repr(k)
-                out[ks] = deep_serialize(v)
-            return out
+            return {str(k): deep_serialize(v) for k, v in obj.items()}
         if isinstance(obj, (list, tuple, set)):
             return [deep_serialize(i) for i in obj]
         if hasattr(obj, "__dict__"):
-            try:
-                return deep_serialize(getattr(obj, "__dict__"))
-            except Exception:
-                pass
+            return deep_serialize(obj.__dict__)
         return str(obj)
     except Exception:
-        try:
-            return str(obj)
-        except Exception:
-            return "<unserializable>"
+        return "<unserializable>"
+
 
 def serialize_mt5_result(obj):
     if obj is None:
@@ -96,50 +108,32 @@ def serialize_mt5_result(obj):
         )
         for attr in attrs:
             if hasattr(obj, attr):
-                try:
-                    val = getattr(obj, attr)
-                    out[attr] = deep_serialize(val)
-                except Exception:
-                    out[attr] = str(getattr(obj, attr))
-        try:
-            out["_repr"] = deep_serialize(repr(obj))
-        except Exception:
-            out["_repr"] = str(type(obj))
+                out[attr] = deep_serialize(getattr(obj, attr))
+        out["_repr"] = repr(obj)
         return out
     except Exception:
         return {"_error": "serialize_failed", "_repr": str(obj)}
 
 
 # ----------------- CSV trade logging -----------------
-
-def get_data_root():
-    if os.name == "nt":
-        base = os.environ.get("APPDATA", os.path.expanduser("~"))
-    else:
-        base = os.path.join(os.path.expanduser("~"), ".config")
-    root = os.path.join(base, "Trading_System")
-    return root
-
-
 def trades_csv_path_for(account_id):
     root = Path(get_data_root()) / "ipc1" / "agent_logs"
     root.mkdir(parents=True, exist_ok=True)
     return root / f"trades_{account_id}.csv"
 
+
 def ensure_trades_csv_header(path):
     if not path.exists():
-        with open(path, "w", newline='', encoding='utf-8') as f:
+        with open(path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["timestamp", "event", "ticket", "symbol", "side", "volume", "price", "comment", "extra"])
 
+
 def append_trade_record(account_id, record):
-    """
-    record: dict with keys matching CSV header
-    """
     try:
         path = trades_csv_path_for(account_id)
         ensure_trades_csv_header(path)
-        with open(path, "a", newline='', encoding='utf-8') as f:
+        with open(path, "a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow([
                 record.get("timestamp", ""),
@@ -150,20 +144,19 @@ def append_trade_record(account_id, record):
                 record.get("volume", ""),
                 record.get("price", ""),
                 record.get("comment", ""),
-                deep_serialize(record.get("extra", "")),
+                json.dumps(deep_serialize(record.get("extra", "")), ensure_ascii=False),
             ])
     except Exception:
-        # best effort; do not raise as it would crash agent
         try:
             logging.getLogger().exception("Failed to append trade record")
         except Exception:
             pass
 
 
-# ----------------- MT5 helpers (primitive returns) -----------------
+# ----------------- MT5 helpers -----------------
 def get_positions_serialized():
     if mt5 is None:
-        return []
+        logger.error(f"MetaTrader5 import failed in agent: {_MT5_IMPORT_ERROR}")
     try:
         positions = mt5.positions_get()
         out = []
@@ -175,7 +168,7 @@ def get_positions_serialized():
                     "type": "buy" if int(getattr(p, "type", 0)) == 0 else "sell",
                     "volume": float(getattr(p, "volume", 0.0)),
                     "price": float(getattr(p, "price_open", 0.0)),
-                    "profit": float(getattr(p, "profit", 0.0))
+                    "profit": float(getattr(p, "profit", 0.0)),
                 })
         return out
     except Exception:
@@ -184,7 +177,7 @@ def get_positions_serialized():
 
 def get_today_pnl():
     if mt5 is None:
-        return None
+        logger.error(f"MetaTrader5 import failed in agent: {_MT5_IMPORT_ERROR}")
     try:
         now_dt = datetime.datetime.now()
         start_dt = datetime.datetime(now_dt.year, now_dt.month, now_dt.day)
@@ -193,20 +186,38 @@ def get_today_pnl():
             return 0.0
         total = 0.0
         for d in deals:
-            try:
-                total += float(getattr(d, 'profit', 0.0))
-            except Exception:
-                continue
+            total += float(getattr(d, "profit", 0.0))
         return total
     except Exception:
         return None
 
 
+def _normalize_volume(symbol_info, volume):
+    vol_step = float(getattr(symbol_info, "volume_step", 0.01) or 0.01)
+    min_vol = float(getattr(symbol_info, "volume_min", 0.01) or 0.01)
+    max_vol = float(getattr(symbol_info, "volume_max", 100000.0) or 100000.0)
+    v = float(volume)
+    steps = round(v / vol_step)
+    normalized = steps * vol_step
+    normalized = max(min_vol, min(max_vol, normalized))
+    decimals = max(0, int(round(-math.log10(vol_step))) if vol_step < 1 else 0)
+    return round(normalized, decimals)
+
+
+def _map_filling_mode(name):
+    n = (name or "FOK").upper()
+    if n == "IOC":
+        return mt5.ORDER_FILLING_IOC
+    if n == "RETURN":
+        return mt5.ORDER_FILLING_RETURN
+    return mt5.ORDER_FILLING_FOK
+
+
 def place_order_local(symbol, side, volume, deviation=50, price=None, sl=0.0, tp=0.0, magic=0,
-                      comment="agent_trade", filling_mode_name="FOK", order_kind="market", pending_type="limit", logger=None):
-    """Place a market or pending order and return (True, primitive_result) or (False, primitive_error)."""
+                      comment="agent_trade", filling_mode_name="FOK",
+                      order_kind="market", pending_type="limit", logger=None):
     if mt5 is None:
-        return False, "MetaTrader5 module not available"
+        logger.error(f"MetaTrader5 import failed in agent: {_MT5_IMPORT_ERROR}")
 
     try:
         si = mt5.symbol_info(symbol)
@@ -215,50 +226,38 @@ def place_order_local(symbol, side, volume, deviation=50, price=None, sl=0.0, tp
 
         if not si.visible:
             mt5.symbol_select(symbol, True)
-            time.sleep(0.2)
+            time.sleep(0.15)
 
-        # Wait for tick (for market orders and reference)
         tick = None
         for _ in range(20):
             tick = mt5.symbol_info_tick(symbol)
             if tick is not None and getattr(tick, "bid", 0) > 0 and getattr(tick, "ask", 0) > 0:
                 break
-            time.sleep(0.25)
-        if tick is None or (getattr(tick, "bid", 0) == 0 and getattr(tick, "ask", 0) == 0):
+            time.sleep(0.2)
+
+        if tick is None:
             return False, "No prices"
 
-        vol_step = getattr(si, 'volume_step', 0.01)
-        min_vol = getattr(si, 'volume_min', 0.01)
-        max_vol = getattr(si, 'volume_max', 100000.0)
-        normalized_volume = max(min_vol, min(max_vol, round(float(volume) / vol_step) * vol_step))
+        normalized_volume = _normalize_volume(si, volume)
+        filling = _map_filling_mode(filling_mode_name)
 
-        # Map filling name to constant
-        try:
-            name = (filling_mode_name or "FOK").upper()
-            if name == 'IOC':
-                filling = mt5.ORDER_FILLING_IOC
-            elif name == 'RETURN':
-                filling = mt5.ORDER_FILLING_RETURN
-            else:
-                filling = mt5.ORDER_FILLING_FOK
-        except Exception:
-            filling = None
+        kind = (order_kind or "market").lower()
+        side_l = (side or "buy").lower()
 
-        if (order_kind or "market").lower() == "market":
-            # Market order
-            if side.lower() == "buy":
+        if kind == "market":
+            if side_l == "buy":
                 order_type = mt5.ORDER_TYPE_BUY
-                price_to_use = tick.ask if price is None else price
+                price_to_use = float(tick.ask if price is None else price)
             else:
                 order_type = mt5.ORDER_TYPE_SELL
-                price_to_use = tick.bid if price is None else price
+                price_to_use = float(tick.bid if price is None else price)
 
             req = {
                 "action": mt5.TRADE_ACTION_DEAL,
                 "symbol": symbol,
                 "volume": normalized_volume,
                 "type": order_type,
-                "price": float(price_to_use),
+                "price": price_to_use,
                 "sl": float(sl) if sl else 0.0,
                 "tp": float(tp) if tp else 0.0,
                 "deviation": int(deviation),
@@ -268,20 +267,14 @@ def place_order_local(symbol, side, volume, deviation=50, price=None, sl=0.0, tp
                 "type_filling": filling,
             }
         else:
-            # Pending order: must provide a price
             if price is None:
                 return False, "Pending order requires price"
             pt = (pending_type or "limit").lower()
-            if side.lower() == "buy":
-                if pt == "limit":
-                    ptype = mt5.ORDER_TYPE_BUY_LIMIT
-                else:
-                    ptype = mt5.ORDER_TYPE_BUY_STOP
+            if side_l == "buy":
+                ptype = mt5.ORDER_TYPE_BUY_LIMIT if pt == "limit" else mt5.ORDER_TYPE_BUY_STOP
             else:
-                if pt == "limit":
-                    ptype = mt5.ORDER_TYPE_SELL_LIMIT
-                else:
-                    ptype = mt5.ORDER_TYPE_SELL_STOP
+                ptype = mt5.ORDER_TYPE_SELL_LIMIT if pt == "limit" else mt5.ORDER_TYPE_SELL_STOP
+
             req = {
                 "action": mt5.TRADE_ACTION_PENDING,
                 "symbol": symbol,
@@ -300,50 +293,52 @@ def place_order_local(symbol, side, volume, deviation=50, price=None, sl=0.0, tp
         res = mt5.order_send(req)
         if res is None:
             return False, "order_send returned None"
+
         retcode = int(getattr(res, "retcode", -1))
-        # Helpful log for AutoTrading-disabled case
-        try:
-            if retcode == 10027 and logger:
-                logger.warning(f"MT5 returned retcode 10027: AutoTrading disabled for symbol {symbol}")
-        except Exception:
-            pass
-        # 10009 = DONE, 10008 = PLACED (pending)
+        # success: done / placed
         if retcode in (10009, 10008):
             return True, serialize_mt5_result(res)
-        else:
-            return False, serialize_mt5_result(res)
 
+        if logger and retcode in (10026, 10027):
+            logger.warning(f"AutoTrading disabled (retcode={retcode}) for {symbol}")
+
+        return False, serialize_mt5_result(res)
     except Exception as e:
         if logger:
             logger.error(f"place_order exception: {e}\n{traceback.format_exc()}")
         return False, str(e)
 
+
 def close_all_positions_local(logger=None):
     if mt5 is None:
-        return False, "MetaTrader5 module not available"
+        logger.error(f"MetaTrader5 import failed in agent: {_MT5_IMPORT_ERROR}")
     try:
         positions = mt5.positions_get()
         if not positions:
             return True, {"closed": 0}
+
         closed = 0
         last_err = None
+
         for p in positions:
             ticket = int(getattr(p, "ticket", 0))
             symbol = getattr(p, "symbol", "")
             vol = float(getattr(p, "volume", 0.0))
             ptype = int(getattr(p, "type", 0))
+
             tick = mt5.symbol_info_tick(symbol)
             if tick is None:
                 last_err = f"no tick for {symbol}"
                 continue
+
             if ptype == 0:
                 price = tick.bid
                 order_type = mt5.ORDER_TYPE_SELL
             else:
                 price = tick.ask
                 order_type = mt5.ORDER_TYPE_BUY
-            fillings = [mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_RETURN, mt5.ORDER_FILLING_FOK]
-            for f in fillings:
+
+            for f in (mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_RETURN, mt5.ORDER_FILLING_FOK):
                 req = {
                     "action": mt5.TRADE_ACTION_DEAL,
                     "symbol": symbol,
@@ -361,12 +356,11 @@ def close_all_positions_local(logger=None):
                 if res is None:
                     last_err = "order_send returned None"
                     continue
-                if getattr(res, "retcode", None) == 10009:
+                if int(getattr(res, "retcode", -1)) == 10009:
                     closed += 1
                     break
                 last_err = f"retcode {getattr(res, 'retcode', None)}: {getattr(res, 'comment', '')}"
-                if getattr(res, "retcode", None) == 10030:
-                    continue
+
         if closed > 0:
             return True, {"closed": closed}
         return False, last_err or "no-close"
@@ -378,7 +372,7 @@ def close_all_positions_local(logger=None):
 
 def initialize_mt5(path, logger=None):
     if mt5 is None:
-        return False, "MetaTrader5 module not available"
+        logger.error(f"MetaTrader5 import failed in agent: {_MT5_IMPORT_ERROR}")
     try:
         ok = mt5.initialize(path=path, login=0)
         if not ok:
@@ -390,12 +384,12 @@ def initialize_mt5(path, logger=None):
         return False, str(e)
 
 
-# ----------------- Terminal portable helper -----------------
 def ensure_portable_and_start(terminal_path, logger, start_terminal=True):
     proc = None
     tpath = Path(terminal_path)
     if not tpath.exists():
         return None, f"terminal executable not found: {terminal_path}"
+
     tdir = tpath.parent
     try:
         pmarker = tdir / "portable.dat"
@@ -411,12 +405,11 @@ def ensure_portable_and_start(terminal_path, logger, start_terminal=True):
     try:
         if os.name == "nt":
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
-            proc = subprocess.Popen([str(tpath)], cwd=str(tdir), creationflags=creationflags)
+            proc = subprocess.Popen([str(tpath), "/portable"], cwd=str(tdir), creationflags=creationflags)
         else:
             proc = subprocess.Popen([str(tpath)], cwd=str(tdir))
-        logger.info(f"Started terminal process PID={proc.pid} for {tdir}")
-        # allow more time for the terminal to fully initialize (Windows can be slow)
-        time.sleep(6.0)
+        logger.info(f"Started terminal PID={proc.pid} for {tdir}")
+        time.sleep(5.0)
         return proc, None
     except Exception as e:
         logger.error(f"Failed to start terminal exe: {e}")
@@ -430,25 +423,12 @@ def agent_main(cmd_q, resp_q, account_cfg):
     logger.info(f"Agent starting for account {account_id}")
 
     try:
-        logger.info(f"Agent module file: {__file__} | pid={os.getpid()} | python={sys.executable}")
+        logger.info(f"Agent file: {__file__} | pid={os.getpid()} | python={sys.executable}")
     except Exception:
-        try:
-            logger.info(f"Agent started (module path unknown) | pid={os.getpid()}")
-        except Exception:
-            pass
-
-    # record agent start time to ignore stale STOP_AGENTS markers
-    agent_start_ts = time.time()
+        pass
 
     terminal_path = account_cfg.get("terminal_path", "") or ""
     proc_started = None
-
-    # sentinel file (legacy shutdown mechanism) — ignore it to avoid premature exits
-    try:
-        from pathlib import Path as _Path
-        _SENTINEL_PATH = _Path(get_data_root()) / "STOP_AGENTS"
-    except Exception:
-        _SENTINEL_PATH = None
 
     if terminal_path:
         proc, err = ensure_portable_and_start(terminal_path, logger, start_terminal=True)
@@ -457,7 +437,7 @@ def agent_main(cmd_q, resp_q, account_cfg):
         else:
             proc_started = proc
     else:
-        logger.warning("No terminal_path provided in account_cfg; MT5 operations likely to fail")
+        logger.warning("No terminal_path provided in account_cfg")
 
     connected = False
 
@@ -466,18 +446,19 @@ def agent_main(cmd_q, resp_q, account_cfg):
         try:
             if not account_cfg.get("password") or not account_cfg.get("server"):
                 return False, "missing password or server"
+
             ok, err = initialize_mt5(terminal_path, logger=logger)
             if not ok:
-                logger.error(f"initialize failed: {err}")
                 return False, f"init failed: {err}"
+
             if not mt5.login(int(account_cfg["account"]), account_cfg.get("password", ""), account_cfg.get("server", "")):
                 le = mt5.last_error()
-                logger.error(f"login failed: {le}")
                 try:
                     mt5.shutdown()
                 except Exception:
                     pass
                 return False, f"login failed: {le}"
+
             connected = True
             logger.info(f"Logged in: {account_id}")
             return True, None
@@ -485,43 +466,23 @@ def agent_main(cmd_q, resp_q, account_cfg):
             logger.error(f"connect exception: {e}\n{traceback.format_exc()}")
             return False, str(e)
 
-    # more aggressive connect retries to allow terminal enough time to be ready
+    # initial connect retries
     backoff = 1.0
-    for _ in range(12):
+    for _ in range(10):
         ok, err = try_connect()
         if ok:
             break
         time.sleep(backoff)
-        backoff = min(backoff * 2, 30.0)
+        backoff = min(backoff * 1.8, 20.0)
 
     hb_interval = 5.0
-    last_hb = time.time()
+    last_hb = 0.0
 
     try:
         while True:
-            try:
-                cmd = cmd_q.get(timeout=0.5)
-            except Exception:
-                cmd = None
-
-            # Legacy: some external tools create a STOP_AGENTS file to signal shutdown.
-            # Ignore this marker here to keep agents running until explicitly asked via IPC.
-            try:
-                if _SENTINEL_PATH is not None and _SENTINEL_PATH.exists():
-                    logger.info("STOP_AGENTS marker present — ignoring for this agent (keeping running)")
-            except Exception:
-                pass
-            
-
             now = time.time()
-            # auto‑refresh login if connection dropped
-            if connected:
-                try:
-                    ai = mt5.account_info()
-                    if ai is None:
-                        connected = False
-                except Exception:
-                    connected = False
+
+            # heartbeat
             if now - last_hb >= hb_interval:
                 try:
                     resp_q.put({"type": "hb", "account": account_id, "ts": now})
@@ -529,11 +490,26 @@ def agent_main(cmd_q, resp_q, account_cfg):
                     pass
                 last_hb = now
 
+            # keep session alive
+            if connected:
+                try:
+                    ai = mt5.account_info()
+                    if ai is None:
+                        connected = False
+                except Exception:
+                    connected = False
+
+            # receive command
+            try:
+                cmd = cmd_q.get(timeout=0.35)
+            except Exception:
+                cmd = None
+
             if cmd is None:
                 if not connected:
-                    ok, err = try_connect()
+                    ok, _ = try_connect()
                     if not ok:
-                        time.sleep(1.0)
+                        time.sleep(0.7)
                 continue
 
             cid = cmd.get("id", str(uuid.uuid4()))
@@ -546,18 +522,57 @@ def agent_main(cmd_q, resp_q, account_cfg):
                     pass
                 break
 
-            # PLACE ORDER: detect new positions opened and log opens to CSV
+            if action == "get_positions":
+                if not connected:
+                    ok, err = try_connect()
+                    if not ok:
+                        resp_q.put({"id": cid, "status": "error", "error": f"not connected: {err}"})
+                        continue
+                pos = get_positions_serialized()
+                resp_q.put({"id": cid, "status": "ok", "result": pos})
+                continue
+
+            if action == "get_autotrade":
+                if not connected:
+                    ok, err = try_connect()
+                    if not ok:
+                        resp_q.put({"id": cid, "status": "error", "error": f"not connected: {err}"})
+                        continue
+                try:
+                    ai = mt5.account_info()
+                except Exception:
+                    ai = None
+                try:
+                    ti = mt5.terminal_info()
+                except Exception:
+                    ti = None
+
+                out = {
+                    "account_trade_allowed": bool(getattr(ai, "trade_allowed", False)) if ai is not None else None,
+                    "account_info": deep_serialize(ai),
+                    "terminal_info": deep_serialize(ti),
+                }
+                resp_q.put({"id": cid, "status": "ok", "result": out})
+                continue
+
+            if action == "get_today_pnl":
+                if not connected:
+                    ok, err = try_connect()
+                    if not ok:
+                        resp_q.put({"id": cid, "status": "error", "error": f"not connected: {err}"})
+                        continue
+                pnl = get_today_pnl()
+                resp_q.put({"id": cid, "status": "ok", "result": pnl})
+                continue
+
             if action == "place":
                 if not connected:
                     ok, err = try_connect()
                     if not ok:
-                        try:
-                            resp_q.put({"id": cid, "status": "error", "error": f"not connected: {err}"})
-                        except Exception:
-                            pass
+                        resp_q.put({"id": cid, "status": "error", "error": f"not connected: {err}"})
                         continue
 
-                # capture positions before for open-detection logging
+                # snapshot before
                 try:
                     before = mt5.positions_get() or []
                     before_tickets = {int(getattr(p, "ticket", 0)): p for p in before}
@@ -577,186 +592,101 @@ def agent_main(cmd_q, resp_q, account_cfg):
                 pending_type = cmd.get("pending_type", "limit")
                 price_value = cmd.get("price", None)
 
-                ok, res = place_order_local(symbol, side, volume, deviation=deviation,
-                                            price=price_value, sl=sl, tp=tp, magic=magic,
-                                            comment=comment, filling_mode_name=filling,
-                                            order_kind=order_kind, pending_type=pending_type,
-                                            logger=logger)
+                ok, res = place_order_local(
+                    symbol, side, volume,
+                    deviation=deviation,
+                    price=price_value,
+                    sl=sl, tp=tp, magic=magic,
+                    comment=comment,
+                    filling_mode_name=filling,
+                    order_kind=order_kind,
+                    pending_type=pending_type,
+                    logger=logger
+                )
 
-                # after placing, detect new positions and log opens (if any)
+                # snapshot after (for open logging)
                 try:
                     after = mt5.positions_get() or []
                     after_tickets = {int(getattr(p, "ticket", 0)): p for p in after}
                 except Exception:
                     after_tickets = {}
+
                 new_tickets = set(after_tickets.keys()) - set(before_tickets.keys())
                 for t in new_tickets:
                     p = after_tickets.get(t)
-                    try:
-                        rec = {
-                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
-                            "event": "open",
-                            "ticket": int(getattr(p, "ticket", 0)),
-                            "symbol": getattr(p, "symbol", ""),
-                            "side": "buy" if int(getattr(p, "type", 0)) == 0 else "sell",
-                            "volume": float(getattr(p, "volume", 0.0)),
-                            "price": float(getattr(p, "price_open", 0.0)),
-                            "comment": comment,
-                            "extra": serialize_mt5_result(res) if isinstance(res, dict) else deep_serialize(res),
-                        }
-                        append_trade_record(account_id, rec)
-                        logger.info(f"Logged open trade: {rec}")
-                    except Exception:
-                        logger.exception("Failed to log open trade")
-
-                try:
-                    if ok:
-                        resp_q.put({"id": cid, "status": "ok", "result": res})
-                    else:
-                        resp_q.put({"id": cid, "status": "error", "error": deep_serialize(res)})
-                except Exception:
-                    pass
-                continue
-
-            # GET POSITIONS
-            if action == "get_positions":
-                if not connected:
-                    ok, err = try_connect()
-                    if not ok:
-                        try:
-                            resp_q.put({"id": cid, "status": "error", "error": f"not connected: {err}"})
-                        except Exception:
-                            pass
-                        continue
-                pos = get_positions_serialized()
-                try:
-                    resp_q.put({"id": cid, "status": "ok", "result": pos})
-                except Exception:
-                    pass
-                continue
-
-            # GET AUTOTRADE STATUS
-            if action == "get_autotrade":
-                if not connected:
-                    ok, err = try_connect()
-                    if not ok:
-                        try:
-                            resp_q.put({"id": cid, "status": "error", "error": f"not connected: {err}"})
-                        except Exception:
-                            pass
-                        continue
-                # collect account_info and terminal_info safely
-                try:
-                    ai = mt5.account_info()
-                except Exception:
-                    ai = None
-                try:
-                    ti = mt5.terminal_info()
-                except Exception:
-                    ti = None
-                try:
-                    out = {
-                        "account_trade_allowed": None,
-                        "account_info": deep_serialize(ai),
-                        "terminal_info": deep_serialize(ti),
+                    rec = {
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+                        "event": "open",
+                        "ticket": int(getattr(p, "ticket", 0)),
+                        "symbol": getattr(p, "symbol", ""),
+                        "side": "buy" if int(getattr(p, "type", 0)) == 0 else "sell",
+                        "volume": float(getattr(p, "volume", 0.0)),
+                        "price": float(getattr(p, "price_open", 0.0)),
+                        "comment": comment,
+                        "extra": deep_serialize(res),
                     }
-                    if ai is not None:
-                        try:
-                            out["account_trade_allowed"] = bool(getattr(ai, "trade_allowed", None))
-                        except Exception:
-                            out["account_trade_allowed"] = None
-                    resp_q.put({"id": cid, "status": "ok", "result": out})
-                except Exception:
-                    try:
-                        resp_q.put({"id": cid, "status": "error", "error": "failed to collect autotrade status"})
-                    except Exception:
-                        pass
+                    append_trade_record(account_id, rec)
+
+                if ok:
+                    resp_q.put({"id": cid, "status": "ok", "result": res})
+                else:
+                    resp_q.put({"id": cid, "status": "error", "error": deep_serialize(res)})
                 continue
 
-            if action == "get_today_pnl":
-                if not connected:
-                    ok, err = try_connect()
-                    if not ok:
-                        try:
-                            resp_q.put({"id": cid, "status": "error", "error": f"not connected: {err}"})
-                        except Exception:
-                            pass
-                        continue
-                pnl = get_today_pnl()
-                try:
-                    resp_q.put({"id": cid, "status": "ok", "result": pnl})
-                except Exception:
-                    pass
-                continue
-
-            # CLOSE ALL: capture before, call close, then detect closed tickets and log closes
             if action == "close_all":
                 if not connected:
                     ok, err = try_connect()
                     if not ok:
-                        try:
-                            resp_q.put({"id": cid, "status": "error", "error": f"not connected: {err}"})
-                        except Exception:
-                            pass
+                        resp_q.put({"id": cid, "status": "error", "error": f"not connected: {err}"})
                         continue
+
                 try:
                     before = mt5.positions_get() or []
                     before_map = {int(getattr(p, "ticket", 0)): p for p in before}
                 except Exception:
                     before_map = {}
+
                 ok, res = close_all_positions_local(logger=logger)
-                # give a small pause for closure to propagate
                 time.sleep(0.5)
+
                 try:
                     after = mt5.positions_get() or []
                     after_map = {int(getattr(p, "ticket", 0)): p for p in after}
                 except Exception:
                     after_map = {}
+
                 closed_tickets = set(before_map.keys()) - set(after_map.keys())
                 for t in closed_tickets:
                     p = before_map.get(t)
-                    try:
-                        rec = {
-                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
-                            "event": "close",
-                            "ticket": int(getattr(p, "ticket", 0)),
-                            "symbol": getattr(p, "symbol", ""),
-                            "side": "buy" if int(getattr(p, "type", 0)) == 0 else "sell",
-                            "volume": float(getattr(p, "volume", 0.0)),
-                            "price": "",  # exact close price not trivially available here
-                            "comment": "close_all",
-                            "extra": deep_serialize(res),
-                        }
-                        append_trade_record(account_id, rec)
-                        logger.info(f"Logged close trade: {rec}")
-                    except Exception:
-                        logger.exception("Failed to log close trade")
-                try:
-                    if ok:
-                        resp_q.put({"id": cid, "status": "ok", "result": res})
-                    else:
-                        resp_q.put({"id": cid, "status": "error", "error": deep_serialize(res)})
-                except Exception:
-                    pass
+                    rec = {
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+                        "event": "close",
+                        "ticket": int(getattr(p, "ticket", 0)),
+                        "symbol": getattr(p, "symbol", ""),
+                        "side": "buy" if int(getattr(p, "type", 0)) == 0 else "sell",
+                        "volume": float(getattr(p, "volume", 0.0)),
+                        "price": "",
+                        "comment": "close_all",
+                        "extra": deep_serialize(res),
+                    }
+                    append_trade_record(account_id, rec)
+
+                if ok:
+                    resp_q.put({"id": cid, "status": "ok", "result": res})
+                else:
+                    resp_q.put({"id": cid, "status": "error", "error": deep_serialize(res)})
                 continue
 
-            # Unknown action
-            try:
-                resp_q.put({"id": cid, "status": "error", "error": f"unknown action {action}"})
-            except Exception:
-                pass
+            resp_q.put({"id": cid, "status": "error", "error": f"unknown action {action}"})
 
     except KeyboardInterrupt:
-        logger.info("Agent received KeyboardInterrupt, exiting")
+        logger.info("Agent keyboard interrupt")
     except Exception as e:
         logger.error(f"Agent main loop exception: {e}\n{traceback.format_exc()}")
     finally:
         try:
             if mt5 is not None:
-                try:
-                    mt5.shutdown()
-                except Exception:
-                    pass
+                mt5.shutdown()
         except Exception:
             pass
 
@@ -769,8 +699,9 @@ def agent_main(cmd_q, resp_q, account_cfg):
                 proc_started.wait(timeout=3)
             except Exception:
                 pass
+
         logger.info(f"Agent for {account_id} exiting")
 
 
 if __name__ == "__main__":
-    print("agent.py module (agent_main) - meant to be started by the controller")
+    print("agent.py module (agent_main) - start via controller")
