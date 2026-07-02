@@ -37,8 +37,6 @@ Professional MetaTrader 5 multi-account copier with per-account process isolatio
 
 [![Watch the demo](https://img.youtube.com/vi/1PcWj2LBUkQ/maxresdefault.jpg)](https://youtu.be/1PcWj2LBUkQ)
 
-Or use this direct link placeholder:  
-**Demo:** VIDEO_URL_HERE
 
 ## Requirements (User Quick Setup)
 
